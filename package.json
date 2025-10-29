@@ -1,0 +1,21 @@
+{
+  "name": "sqlserver-cdc-sync",
+  "version": "1.0.0",
+  "description": "Sistema de sincronización en tiempo real usando CDC de SQL Server",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "setup-cdc": "node scripts/setup-cdc.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "mssql": "^11.0.1",
+    "node-cron": "^3.0.3",
+    "tedious": "^16.7.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
