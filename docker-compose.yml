@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  cdc-sync:
+    build: .
+    env_file: .env
+    volumes:
+      - ./logs:/usr/src/app/logs
+    restart: unless-stopped

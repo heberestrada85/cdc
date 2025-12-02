@@ -70,6 +70,38 @@ Los logs se guardan en:
 - `logs/combined.log`: Todos los eventos
 - Consola: Salida en tiempo real
 
+## Despliegue con Docker
+
+### Construir la imagen localmente
+```bash
+docker build -t cdc-sync .
+```
+
+### Ejecutar el contenedor
+```bash
+docker run -d \
+  --env-file .env \
+  -v $(pwd)/logs:/usr/src/app/logs \
+  --name cdc-sync \
+  cdc-sync
+```
+
+### Usar docker-compose (desarrollo)
+```bash
+docker-compose up -d
+```
+
+## Configuración de GitHub Actions
+
+El workflow está configurado para:
+- Construir la imagen Docker en cada push a la rama main
+- Hacer push de la imagen a Docker Hub
+- Usar caché para builds más rápidos
+
+### Secrets requeridos en GitHub:
+- `DOCKERHUB_USERNAME`: Tu nombre de usuario de Docker Hub
+- `DOCKERHUB_TOKEN`: Token de acceso a Docker Hub
+
 ## Contribución
 1. Fork el proyecto
 2. Crea una rama para tu feature

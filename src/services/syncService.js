@@ -9,72 +9,295 @@ class SyncService {
     this.targetConnection = new ConnectionRunner(target.conn, target.config, logger, 'target');
     this.businessRules = new BusinessRules();
     this.syncState = new Map();
+    this.syncLocks = new Map(); // Lock para evitar MERGE simultáneos
+    this.processId = `PID-${process.pid}-${Date.now()}`; // ID único para este proceso
+  }
+
+  /**
+   * Registra una operación en la tabla CDC_SyncLog
+   */
+  async writeLog(tableName, tipoOperacion, registroId, estado, mensaje = null, datosAntes = null, datosDespues = null, tiempoMs = null) {
+    try {
+      // Escapar strings para SQL
+      const escapeSql = (str) => {
+        if (str === null || str === undefined) return 'NULL';
+        return `'${String(str).replace(/'/g, "''")}'`;
+      };
+
+      const datosAntesJson = datosAntes ? JSON.stringify(datosAntes).substring(0, 8000) : null; // Limitar tamaño
+      const datosDespuesJson = datosDespues ? JSON.stringify(datosDespues).substring(0, 8000) : null;
+
+      const query = `
+        INSERT INTO dbo.CDC_SyncLog
+        (TablaNombre, TipoOperacion, RegistroId, Estado, Mensaje, DatosAntes, DatosDespues, TiempoEjecucionMs, ProcesoId)
+        VALUES
+        (${escapeSql(tableName)}, ${escapeSql(tipoOperacion)}, ${escapeSql(registroId)}, ${escapeSql(estado)},
+         ${escapeSql(mensaje)}, ${escapeSql(datosAntesJson)}, ${escapeSql(datosDespuesJson)},
+         ${tiempoMs || 'NULL'}, ${escapeSql(this.processId)})
+      `;
+
+      await this.sourceConnection.exec(query);
+    } catch (error) {
+      // No fallar si el log falla, solo registrar el error
+      logger.debug(`Error escribiendo en CDC_SyncLog: ${error.message}`);
+    }
+  }
+
+  async ensureCDCEnabled(tableName, schemaName) {
+    try {
+      // Verificar si CDC está habilitado en la base de datos
+      const dbCDCCheck = await this.sourceConnection.query(`
+        SELECT is_cdc_enabled
+        FROM sys.databases
+        WHERE name = DB_NAME()
+      `);
+
+      if (dbCDCCheck[0].is_cdc_enabled === 0) {
+        logger.info(`Habilitando CDC en la base de datos...`);
+        await this.sourceConnection.exec(`EXEC sys.sp_cdc_enable_db`);
+        logger.info(`CDC habilitado en la base de datos`);
+      }
+
+      // Verificar si CDC está habilitado en la tabla
+      const tableCDCCheck = await this.sourceConnection.query(`
+        SELECT is_tracked_by_cdc
+        FROM sys.tables
+        WHERE schema_id = SCHEMA_ID('${schemaName}')
+        AND name = '${tableName}'
+      `);
+
+      if (tableCDCCheck.length === 0) {
+        throw new Error(`Tabla ${schemaName}.${tableName} no existe en la base de datos origen`);
+      }
+
+      if (tableCDCCheck[0].is_tracked_by_cdc === 0) {
+        logger.info(`Habilitando CDC en la tabla ${schemaName}.${tableName}...`);
+        await this.sourceConnection.exec(`
+          EXEC sys.sp_cdc_enable_table
+            @source_schema = N'${schemaName}',
+            @source_name = N'${tableName}',
+            @role_name = NULL,
+            @supports_net_changes = 1
+        `);
+        logger.info(`CDC habilitado en la tabla ${schemaName}.${tableName}`);
+      } else {
+        logger.debug(`CDC ya está habilitado en ${schemaName}.${tableName}`);
+      }
+    } catch (error) {
+      logger.error(`Error habilitando CDC en ${schemaName}.${tableName}:`, error);
+      throw error;
+    }
   }
 
   async isTargetTableEmpty(tableName, schemaName) {
     const query = `SELECT TOP 1 1 as existsFlag FROM ${schemaName}.${tableName}`;
-    const result = await new (require('../config/cdcService'))(this.targetConnection).executeQuery(query);
+    const result = await this.targetConnection.query(query);
     console.log('[DEBUG] isTargetTableEmpty query:', result);
     return result.length === 0;
   }
 
 
   async snapshotInitial(tableName, schemaName) {
-    logger.info(`Realizando snapshot inicial para ${schemaName}.${tableName}...`);
+    logger.info(`Realizando sincronización inicial (MERGE) para ${schemaName}.${tableName}...`);
+
+    // Obtener la clave primaria de la tabla
+    const primaryKey = await this.getPrimaryKey(tableName, schemaName);
 
     // Obtener todos los registros de la tabla origen
-    const sourceService = new (require('../config/cdcService'))(this.sourceConnection);
-    const rows = await sourceService.executeQuery(`SELECT * FROM ${schemaName}.${tableName}`);
+    const rows = await this.sourceConnection.query(`SELECT * FROM ${schemaName}.${tableName}`);
+
+    logger.info(`Total de registros en origen: ${rows.length}`);
+
+    let insertCount = 0;
+    let updateCount = 0;
+    let skipCount = 0;
+    let errorCount = 0;
 
     for (const row of rows) {
-      // Aplicar reglas de negocio antes de insertar
-      const processedData = await this.businessRules.applyRules(row, tableName, 'INSERT');
-      if (!processedData) {
-        logger.debug(`Registro filtrado por reglas de negocio en snapshot para ${tableName}`);
+      const startTime = Date.now();
+      let pkValue = null;
+
+      try {
+        // Aplicar reglas de negocio
+        const processedData = await this.businessRules.applyRules(row, tableName, 'INSERT');
+        if (!processedData) {
+          logger.debug(`Registro filtrado por reglas de negocio en snapshot para ${tableName}`);
+          skipCount++;
+          continue;
+        }
+
+        // Verificar si el registro ya existe en destino
+        pkValue = processedData[primaryKey];
+
+        // Usar query directa sin parámetros para evitar problemas
+        const existsQuery = `SELECT COUNT(*) as count FROM ${schemaName}.${tableName} WHERE ${primaryKey} = ${pkValue}`;
+        const existsResult = await this.targetConnection.query(existsQuery);
+
+        logger.debug(`Verificando registro ${primaryKey}=${pkValue}, existe: ${existsResult[0]?.count > 0}`);
+
+        if (existsResult[0]?.count > 0) {
+          // El registro existe → verificar si necesita UPDATE
+          const currentQuery = `SELECT * FROM ${schemaName}.${tableName} WHERE ${primaryKey} = ${pkValue}`;
+          const currentResult = await this.targetConnection.query(currentQuery);
+
+          if (!currentResult || currentResult.length === 0) {
+            logger.warn(`Registro ${primaryKey}=${pkValue} reportado como existente pero no se pudo obtener. Insertando...`);
+            await this.handleInsert(processedData, tableName, schemaName);
+            insertCount++;
+
+            const timeElapsed = Date.now() - startTime;
+            await this.writeLog(tableName, 'INSERT', pkValue, 'SUCCESS',
+              'Registro insertado después de verificación fallida', null, processedData, timeElapsed);
+            continue;
+          }
+
+          const currentData = currentResult[0];
+
+          // Comparar campos (excluir campos de control como modifica, estatus)
+          const needsUpdate = this.compareRecords(processedData, currentData, [primaryKey, 'modifica', 'estatus']);
+
+          if (needsUpdate) {
+            await this.handleUpdate(processedData, tableName, schemaName);
+            updateCount++;
+            logger.info(`✓ Registro ${primaryKey}=${pkValue} actualizado`);
+
+            const timeElapsed = Date.now() - startTime;
+            await this.writeLog(tableName, 'UPDATE', pkValue, 'SUCCESS',
+              'Registro actualizado con cambios detectados', currentData, processedData, timeElapsed);
+          } else {
+            skipCount++;
+            logger.debug(`Registro ${primaryKey}=${pkValue} ya está actualizado`);
+
+            const timeElapsed = Date.now() - startTime;
+            await this.writeLog(tableName, 'SKIP', pkValue, 'SKIPPED',
+              'Registro sin cambios, omitido', null, null, timeElapsed);
+          }
+        } else {
+          // El registro NO existe → INSERT
+          await this.handleInsert(processedData, tableName, schemaName);
+          insertCount++;
+          logger.info(`✓ Registro ${primaryKey}=${pkValue} insertado`);
+
+          const timeElapsed = Date.now() - startTime;
+          await this.writeLog(tableName, 'INSERT', pkValue, 'SUCCESS',
+            'Registro insertado correctamente', null, processedData, timeElapsed);
+        }
+      } catch (error) {
+        errorCount++;
+        logger.error(`Error procesando registro ${pkValue || row[primaryKey]} en snapshot para ${tableName}:`, error);
+
+        const timeElapsed = Date.now() - startTime;
+        await this.writeLog(tableName, 'ERROR', pkValue || row[primaryKey], 'ERROR',
+          error.message, row, null, timeElapsed);
+        // Continuar con el siguiente registro
+      }
+    }
+
+    logger.info(`Sincronización inicial completada para ${schemaName}.${tableName}: ${insertCount} insertados, ${updateCount} actualizados, ${skipCount} omitidos, ${errorCount} errores`);
+  }
+
+  // Método auxiliar para comparar dos registros
+  compareRecords(newRecord, oldRecord, excludeFields = []) {
+    const excludeSet = new Set(excludeFields.map(f => f.toLowerCase()));
+
+    for (const key of Object.keys(newRecord)) {
+      if (excludeSet.has(key.toLowerCase())) continue;
+
+      const newValue = newRecord[key];
+      const oldValue = oldRecord[key];
+
+      // Comparar valores (considerar null/undefined como iguales)
+      if (newValue == null && oldValue == null) continue;
+      if (newValue == null || oldValue == null) return true;
+
+      // Para buffers, comparar contenido
+      if (Buffer.isBuffer(newValue) && Buffer.isBuffer(oldValue)) {
+        if (!newValue.equals(oldValue)) return true;
         continue;
       }
 
-      // Insertar en destino
-      await this.handleInsert(processedData, tableName, schemaName);
+      // Para fechas, comparar timestamps
+      if (newValue instanceof Date && oldValue instanceof Date) {
+        if (newValue.getTime() !== oldValue.getTime()) return true;
+        continue;
+      }
+
+      // Comparación normal
+      if (newValue !== oldValue) return true;
     }
 
-    logger.info(`Snapshot inicial completado para ${schemaName}.${tableName}`);
+    return false; // No hay diferencias
   }
 
   async syncTable(tableName, schemaName = 'dbo') {
+    const tableKey = `${schemaName}.${tableName}`;
+
+    // 🔒 Verificar si ya hay una sincronización en progreso para esta tabla
+    if (this.syncLocks.get(tableKey)) {
+      logger.debug(`Sincronización ya en progreso para ${tableKey}, omitiendo...`);
+      return;
+    }
+
+    // Establecer el lock
+    this.syncLocks.set(tableKey, true);
+
     try {
+      // 1️⃣ Asegurar que CDC esté habilitado en la tabla origen
+      await this.ensureCDCEnabled(tableName, schemaName);
+
+      // 2️⃣ Asegurar que la tabla destino exista con estructura correcta
       await this.ensureTableAndColumnsExist(tableName, schemaName, {});
 
-      const isEmpty = await this.isTargetTableEmpty(tableName, schemaName);
+      // 3️⃣ Verificar si ya se hizo la sincronización inicial
+      const initialSyncKey = `${tableKey}_initial_sync_done`;
+      const initialSyncDone = this.syncState.get(initialSyncKey);
 
-      if (isEmpty) {
-        logger.info(`Tabla destino ${schemaName}.${tableName} vacía → ejecutando snapshot inicial`);
+      if (!initialSyncDone) {
+        // Primera ejecución: hacer MERGE completo (INSERT/UPDATE)
+        logger.info(`Primera sincronización para ${tableKey} → ejecutando MERGE inicial`);
         await this.snapshotInitial(tableName, schemaName);
-        return; // No procesar CDC en este arranque
+
+        // Marcar como sincronizado inicialmente
+        this.syncState.set(initialSyncKey, true);
+
+        // Guardar el LSN actual para futuros ciclos CDC
+        const CDCService = require('../config/cdcService');
+        const cdcService = new CDCService(this.sourceConnection.conn);
+        const currentLSN = await cdcService.getLastLSN();
+        if (currentLSN) {
+          this.syncState.set(tableKey, currentLSN);
+          logger.info(`LSN inicial guardado para ${tableKey}`);
+        }
+
+        return; // No procesar CDC en este primer ciclo
       }
 
-      // CDC normal si la tabla ya tiene datos
-      const cdcService = new (require('../config/cdcService'))(this.sourceConnection);
-      const lastProcessedLSN = this.syncState.get(`${schemaName}.${tableName}`) || null;
+      // 4️⃣ Ciclos posteriores: procesar solo cambios CDC
+      const CDCService = require('../config/cdcService');
+      const cdcService = new CDCService(this.sourceConnection.conn);
+      const lastProcessedLSN = this.syncState.get(tableKey) || null;
 
       const changes = await cdcService.getTableChanges(tableName, schemaName, lastProcessedLSN);
 
       if (changes.length === 0) {
-        logger.debug(`No hay cambios para la tabla ${schemaName}.${tableName}`);
+        logger.debug(`No hay cambios CDC para ${tableKey}`);
         return;
       }
 
-      logger.info(`Procesando ${changes.length} cambios para ${schemaName}.${tableName}`);
+      logger.info(`Procesando ${changes.length} cambios CDC para ${tableKey}`);
 
       for (const change of changes) {
         await this.processChange(change, tableName, schemaName);
-        this.syncState.set(`${schemaName}.${tableName}`, change.start_lsn);
+        this.syncState.set(tableKey, change.start_lsn);
       }
 
-      logger.info(`Sincronización completada para ${schemaName}.${tableName}`);
+      logger.info(`Sincronización CDC completada para ${tableKey}`);
     } catch (error) {
       logger.error(`Error sincronizando tabla ${schemaName}.${tableName}:`, error);
       throw error;
+    } finally {
+      // 🔓 Liberar el lock siempre, incluso si hubo error
+      this.syncLocks.delete(tableKey);
     }
   }
 
@@ -108,34 +331,56 @@ class SyncService {
     try {
       await this.ensureTableAndColumnsExist(tableName, schemaName, data);
       const columns = Object.keys(data).filter(key => !key.startsWith('__$'));
-      const values = columns.map(col => data[col]);
+
+      // Lista de columnas binarias conocidas
+      const binaryCols = new Set([
+        'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
+        'CardChecador', 'passChecador'
+      ]);
+
+      // Construir VALUES con CONVERT para columnas varbinary
+      const valuesList = columns.map(col => {
+        const v = data[col];
+
+        if (binaryCols.has(col)) {
+          // Para columnas binarias, usar CONVERT
+          if (Buffer.isBuffer(v)) {
+            if (v.length === 0) return 'NULL';  // Buffer vacío
+            return `CONVERT(varbinary(max), '0x${v.toString('hex')}', 1)`;
+          } else if (typeof v === 'string') {
+            if (!v || v === '' || v === '0x') return 'NULL';  // String vacío
+            let hexStr = v.startsWith('0x') ? v.substring(2) : v;
+            // Validar que solo contiene caracteres hex válidos
+            if (!/^[0-9a-fA-F]*$/.test(hexStr)) return 'NULL';
+            // Pad con 0 a la izquierda si la longitud es impar
+            if (hexStr.length % 2 !== 0) {
+              hexStr = '0' + hexStr;
+            }
+            return `CONVERT(varbinary(max), '0x${hexStr}', 1)`;
+          } else if (v == null) {
+            return 'NULL';
+          }
+        }
+
+        // Para otros tipos, formatear normalmente
+        if (v === null || v === undefined) return 'NULL';
+        if (v instanceof Date) return `'${v.toISOString()}'`;
+        if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`;
+        if (typeof v === 'number') return v;
+        if (typeof v === 'boolean') return v ? '1' : '0';
+        return `'${v}'`;
+      });
 
       const query = `
+        SET IDENTITY_INSERT ${schemaName}.${tableName} ON;
         INSERT INTO ${schemaName}.${tableName} (${columns.join(', ')})
-        VALUES (${columns.map((_, i) => `@param${i}`).join(', ')})
+        VALUES (${valuesList.join(', ')});
+        SET IDENTITY_INSERT ${schemaName}.${tableName} OFF;
       `;
 
-      // 🔹 Función para reemplazar parámetros por valores reales
-      const prettyQuery = (sql, vals) => {
-        let q = sql;
-        vals.forEach((v, i) => {
-          let val = v;
-          if (Buffer.isBuffer(v)) val = `'0x${v.toString('hex')}'`;
-          else if (v instanceof Date) val = `'${v.toISOString()}'`;
-          else if (typeof v === 'string') val = `'${v.replace(/'/g, "''")}'`;
-          else if (v === null || v === undefined) val = 'NULL';
-          q = q.replace(`@param${i}`, val);
-        });
-        return q;
-      };
+      console.log('Executing INSERT:\n', query);
 
-      console.log('Executing INSERT:\n', prettyQuery(query, values));
-
-
-      //await this.executeTargetQuery(query, values);
-      await this.executeTargetQuery(`SET IDENTITY_INSERT ${schemaName}.${tableName} ON; ${prettyQuery(query, values)}; SET IDENTITY_INSERT ${schemaName}.${tableName} OFF;`);
-
-
+      await this.executeTargetQuery(query);
       logger.debug(`INSERT ejecutado para ${tableName}`);
     } catch (error) {
       logger.error(`Error en INSERT para ${tableName}:`, error);
@@ -348,12 +593,22 @@ class SyncService {
 
         if (binaryCols.has(col)) {
           // Si viene Buffer -> convertir a '0x' + hex (estilo 1)
-          if (Buffer.isBuffer(v)) return '0x' + v.toString('hex');
+          if (Buffer.isBuffer(v)) {
+            if (v.length === 0) return null;
+            return '0x' + v.toString('hex');
+          }
 
-          // Si viene string -> asegurar prefijo '0x'
+          // Si viene string -> asegurar prefijo '0x' y pad si es impar
           if (typeof v === 'string') {
-            if (!v.length) return null;         // cadena vacía => NULL
-            return v.startsWith('0x') ? v : ('0x' + v);
+            if (!v.length || v === '0x') return null;  // cadena vacía => NULL
+            let hexStr = v.startsWith('0x') ? v.substring(2) : v;
+            // Validar que solo contiene caracteres hex válidos
+            if (!/^[0-9a-fA-F]*$/.test(hexStr)) return null;
+            // Pad con 0 a la izquierda si la longitud es impar
+            if (hexStr.length % 2 !== 0) {
+              hexStr = '0' + hexStr;
+            }
+            return '0x' + hexStr;
           }
 
           // null/undefined -> NULL
@@ -395,8 +650,6 @@ class SyncService {
   }
 
   async getTableColumns(tableName, schemaName) {
-    const cdcService = new (require('../config/cdcService'))(this.sourceConnection);
-
     const query = `
       SELECT COLUMN_NAME
       FROM INFORMATION_SCHEMA.COLUMNS
@@ -404,7 +657,7 @@ class SyncService {
         AND TABLE_NAME = '${tableName}'
     `;
 
-    const result = await cdcService.executeQuery(query);
+    const result = await this.sourceConnection.query(query);
     return result.map(r => r.COLUMN_NAME);
   }
 
@@ -426,65 +679,43 @@ class SyncService {
   }
 
   async getPrimaryKey(tableName, schemaName) {
-    const cdcService = new (require('../config/cdcService'))(this.sourceConnection);
-
     const query = `SELECT c.name AS COLUMN_NAME
       FROM sys.columns c
       JOIN sys.objects o ON o.object_id = c.object_id
       WHERE o.type = 'U' AND o.name = '${tableName}' and c.is_identity = 1;`;
 
-    const result = await cdcService.executeQuery(query);
+    const result = await this.sourceConnection.query(query);
     return result.length ? result[0].COLUMN_NAME : null;
   }
 
   async executeTargetQuery(query, parameters = []) {
-    const { Request, TYPES } = require('tedious');
+    // Si no hay parámetros, ejecutar directamente (query ya tiene valores interpolados)
+    if (parameters.length === 0) {
+      return await this.targetConnection.exec(query);
+    }
 
-    const detectTediousType = (val) => {
-      if (val === null || val === undefined) return TYPES.NVarChar;
-      if (typeof val === 'string') return TYPES.NVarChar;
-      if (typeof val === 'number') {
-        return Number.isInteger(val) ? TYPES.Int : TYPES.Float;
-      }
-      if (val instanceof Date) return TYPES.DateTime;
-      if (Buffer.isBuffer(val)) return TYPES.VarBinary;
-      if (typeof val === 'boolean') return TYPES.Bit;
-      if (typeof val === 'object' && 'value' in val) {
-        return detectTediousType(val.value);
-      }
-      return TYPES.NVarChar;
-    };
+    // Si hay parámetros, convertir a formato del ConnectionRunner
+    const { TYPES } = require('tedious');
+    const params = parameters.map((param, index) => ({
+      name: `param${index}`,
+      type: this._detectType(param),
+      value: param
+    }));
 
-    const normalizeValue = (val) => {
-      if (val && typeof val === 'object' && 'value' in val) {
-        return val.value;
-      }
-      return val;
-    };
+    return await this.targetConnection.exec(query, params);
+  }
 
-    return new Promise(async (resolve, reject) => {
-      if (this.targetConnection.state !== this.targetConnection.STATE.LoggedIn) {
-        console.log('Connection not logged in, attempting to reconnect...');
-        await this.reconnectTarget();
-      }
-
-      const request = new Request(query, (err, rowCount) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rowCount);
-        }
-      });
-
-      parameters.forEach((param, index) => {
-        const cleanVal = normalizeValue(param);
-        const type = detectTediousType(cleanVal);
-        request.addParameter(`param${index}`, type, cleanVal);
-      });
-
-      this.targetConnection.query(request);
-    });
-
+  _detectType(val) {
+    const { TYPES } = require('tedious');
+    if (val === null || val === undefined) return TYPES.NVarChar;
+    if (typeof val === 'string') return TYPES.NVarChar;
+    if (typeof val === 'number') {
+      return Number.isInteger(val) ? TYPES.Int : TYPES.Float;
+    }
+    if (val instanceof Date) return TYPES.DateTime;
+    if (Buffer.isBuffer(val)) return TYPES.VarBinary;
+    if (typeof val === 'boolean') return TYPES.Bit;
+    return TYPES.NVarChar;
   }
 
   async reconnectTarget() {
@@ -522,15 +753,13 @@ class SyncService {
   }
 
   async ensureTableAndColumnsExist(tableName, schemaName, data) {
-    const cdcService = new (require('../config/cdcService'))(this.targetConnection);
-
     // 1️⃣ Verificar si la tabla existe
     const tableCheckQuery = `
       SELECT COUNT(*) AS count
       FROM INFORMATION_SCHEMA.TABLES
       WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
     `;
-    const tableCheck = await cdcService.executeQuery(tableCheckQuery);
+    const tableCheck = await this.targetConnection.query(tableCheckQuery);
 
     // if (tableCheck[0].count === 0) {
     //   logger.warn(`Tabla ${schemaName}.${tableName} no existe. Creando...`);
@@ -559,14 +788,14 @@ class SyncService {
     if (tableCheck[0].count === 0) {
       logger.warn(`Tabla ${schemaName}.${tableName} no existe. Creando...`);
 
-      const cdcServiceSource = new (require('../config/cdcService'))(this.sourceConnection);
-
       // Consultar columnas con tipos y si son identidad
       const columnInfoQuery = `
         SELECT
           c.COLUMN_NAME,
           c.DATA_TYPE,
           c.CHARACTER_MAXIMUM_LENGTH,
+          c.NUMERIC_PRECISION,
+          c.NUMERIC_SCALE,
           c.IS_NULLABLE,
           CASE
             WHEN ic.column_id IS NOT NULL THEN 1
@@ -581,30 +810,44 @@ class SyncService {
         WHERE c.TABLE_SCHEMA = '${schemaName}' AND c.TABLE_NAME = '${tableName}'
       `;
 
-      const sourceColumns = await cdcServiceSource.executeQuery(columnInfoQuery);
+      const sourceColumns = await this.sourceConnection.query(columnInfoQuery);
 
       if (!sourceColumns.length) {
         throw new Error(`No se encontraron columnas en la tabla origen ${schemaName}.${tableName}`);
       }
 
-      // Mapear tipo de datos SQL
-      const mapDataType = (dataType, maxLength) => {
-        switch (dataType.toLowerCase()) {
+      // Mapear tipo de datos SQL con tamaños correctos
+      const mapDataType = (col) => {
+        const dataType = col.DATA_TYPE.toLowerCase();
+        const maxLength = col.CHARACTER_MAXIMUM_LENGTH;
+        const precision = col.NUMERIC_PRECISION;
+        const scale = col.NUMERIC_SCALE;
+
+        switch (dataType) {
           case 'nvarchar':
           case 'varchar':
           case 'char':
           case 'nchar':
-            return `${dataType.toUpperCase()}(${maxLength > 0 ? maxLength : 'MAX'})`;
+            return `${col.DATA_TYPE.toUpperCase()}(${maxLength > 0 ? maxLength : 'MAX'})`;
+
+          case 'varbinary':
+          case 'binary':
+            return `${col.DATA_TYPE.toUpperCase()}(${maxLength > 0 ? maxLength : 'MAX'})`;
+
           case 'decimal':
           case 'numeric':
-            return `${dataType.toUpperCase()}(18, 4)`;
+            return `${col.DATA_TYPE.toUpperCase()}(${precision || 18}, ${scale || 0})`;
+
           case 'datetime2':
+          case 'time':
+            return `${col.DATA_TYPE.toUpperCase()}(${scale || 7})`;
+
           case 'datetime':
           case 'date':
-          case 'time':
           case 'int':
           case 'bigint':
           case 'smallint':
+          case 'tinyint':
           case 'bit':
           case 'float':
           case 'real':
@@ -613,9 +856,9 @@ class SyncService {
           case 'ntext':
           case 'money':
           case 'smallmoney':
-          case 'binary':
-          case 'varbinary':
-            return dataType.toUpperCase();
+          case 'image':
+            return col.DATA_TYPE.toUpperCase();
+
           default:
             return 'NVARCHAR(MAX)';
         }
@@ -623,7 +866,7 @@ class SyncService {
 
       // Construcción dinámica de columnas
       let columns = sourceColumns.map(col => {
-        const dataType = mapDataType(col.DATA_TYPE, col.CHARACTER_MAXIMUM_LENGTH);
+        const dataType = mapDataType(col);
         const nullable = col.IS_NULLABLE === 'YES' ? 'NULL' : 'NOT NULL';
         const identity = col.IS_IDENTITY === 1 ? 'IDENTITY(1,1)' : '';
         return {
@@ -652,33 +895,116 @@ class SyncService {
       `;
 
       console.log('Creating table with query:\n', createTableQuery);
-      await cdcService.executeQuery(createTableQuery);
+      await this.targetConnection.exec(createTableQuery);
       logger.info(`Tabla ${schemaName}.${tableName} creada exitosamente`);
       return;
     }
 
 
-    const colQuery = `
+    // 3️⃣ Si la tabla YA existe, verificar y agregar columnas faltantes con tipos correctos
+    logger.info(`Tabla ${schemaName}.${tableName} ya existe. Verificando columnas faltantes...`);
+
+    // Obtener estructura completa de la tabla origen
+    const sourceColumnInfoQuery = `
+      SELECT
+        c.COLUMN_NAME,
+        c.DATA_TYPE,
+        c.CHARACTER_MAXIMUM_LENGTH,
+        c.NUMERIC_PRECISION,
+        c.NUMERIC_SCALE,
+        c.IS_NULLABLE,
+        CASE
+          WHEN ic.column_id IS NOT NULL THEN 1
+          ELSE 0
+        END AS IS_IDENTITY
+      FROM INFORMATION_SCHEMA.COLUMNS c
+      LEFT JOIN sys.columns sc
+        ON sc.object_id = OBJECT_ID('${schemaName}.${tableName}')
+        AND sc.name = c.COLUMN_NAME
+      LEFT JOIN sys.identity_columns ic
+        ON ic.object_id = sc.object_id AND ic.column_id = sc.column_id
+      WHERE c.TABLE_SCHEMA = '${schemaName}' AND c.TABLE_NAME = '${tableName}'
+    `;
+    const sourceColumns = await this.sourceConnection.query(sourceColumnInfoQuery);
+
+    // Obtener columnas existentes en destino
+    const targetColQuery = `
       SELECT COLUMN_NAME
       FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
     `;
-    const colResult = await cdcService.executeQuery(colQuery);
-    const existingColumns = colResult.map(r => r.COLUMN_NAME);
-    const cdcMetadataColumns = new Set(['operation', 'start_lsn', 'seqval', 'update_mask']);
+    const targetColResult = await this.targetConnection.query(targetColQuery);
+    const existingColumns = new Set(targetColResult.map(r => r.COLUMN_NAME.toLowerCase()));
 
-    const missingColumns = Object.keys(data)
-      .filter(col => !col.startsWith('__$'))
-      .filter(col => !existingColumns.includes(col))
-      .filter(col => !cdcMetadataColumns.has(col));
+    // Mapear tipo de datos SQL con tamaños correctos
+    const mapDataType = (col) => {
+      const dataType = col.DATA_TYPE.toLowerCase();
+      const maxLength = col.CHARACTER_MAXIMUM_LENGTH;
+      const precision = col.NUMERIC_PRECISION;
+      const scale = col.NUMERIC_SCALE;
 
+      switch (dataType) {
+        case 'nvarchar':
+        case 'varchar':
+        case 'char':
+        case 'nchar':
+          return `${col.DATA_TYPE.toUpperCase()}(${maxLength > 0 ? maxLength : 'MAX'})`;
+
+        case 'varbinary':
+        case 'binary':
+          return `${col.DATA_TYPE.toUpperCase()}(${maxLength > 0 ? maxLength : 'MAX'})`;
+
+        case 'decimal':
+        case 'numeric':
+          return `${col.DATA_TYPE.toUpperCase()}(${precision || 18}, ${scale || 0})`;
+
+        case 'datetime2':
+        case 'time':
+          return `${col.DATA_TYPE.toUpperCase()}(${scale || 7})`;
+
+        case 'datetime':
+        case 'date':
+        case 'int':
+        case 'bigint':
+        case 'smallint':
+        case 'tinyint':
+        case 'bit':
+        case 'float':
+        case 'real':
+        case 'uniqueidentifier':
+        case 'text':
+        case 'ntext':
+        case 'money':
+        case 'smallmoney':
+        case 'image':
+          return col.DATA_TYPE.toUpperCase();
+
+        default:
+          return 'NVARCHAR(MAX)';
+      }
+    };
+
+    // Encontrar columnas faltantes en destino
+    const missingColumns = sourceColumns.filter(col =>
+      !existingColumns.has(col.COLUMN_NAME.toLowerCase())
+    );
+
+    // Agregar columnas faltantes con su tipo correcto
     for (const col of missingColumns) {
+      const dataType = mapDataType(col);
+      const nullable = col.IS_NULLABLE === 'YES' ? 'NULL' : 'NOT NULL';
+      // No agregar IDENTITY en ALTER TABLE (causaría error)
+
       const alterQuery = `
         ALTER TABLE ${schemaName}.${tableName}
-        ADD [${col}] NVARCHAR(MAX) NULL
+        ADD [${col.COLUMN_NAME}] ${dataType} ${nullable}
       `;
-      await cdcService.executeQuery(alterQuery);
-      logger.info(`Columna '${col}' agregada a ${schemaName}.${tableName}`);
+      await this.targetConnection.exec(alterQuery);
+      logger.info(`Columna '${col.COLUMN_NAME}' (${dataType}) agregada a ${schemaName}.${tableName}`);
+    }
+
+    if (missingColumns.length === 0) {
+      logger.info(`No hay columnas faltantes en ${schemaName}.${tableName}`);
     }
   }
 
@@ -785,7 +1111,9 @@ class ConnectionRunner {
           req = new Request(sql, (err) => err ? reject(err) : resolve(rows));
           params.forEach(p => req.addParameter(p.name, p.type, p.value));
           req.on('row', cols => {
-            const o = {}; cols.forEach(c => o[c.metadata.colName] = c.value); rows.push(o);
+            const o = {};
+            Object.values(cols).forEach(c => o[c.metadata.colName] = c.value);
+            rows.push(o);
           });
         }
         this.conn.execSql(req);

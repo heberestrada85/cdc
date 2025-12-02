@@ -102,7 +102,7 @@ class CDCService {
         request.addParameter(param.name, param.type, param.value);
       });
 
-      this.connection.query(request);
+      this.connection.execSql(request);
     });
   }
 

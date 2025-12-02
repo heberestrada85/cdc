@@ -1,44 +1,35 @@
 // src/services/businessRules.js
 const logger = require('../utils/logger');
+const fs = require('fs');
+const path = require('path');
 
 class BusinessRules {
   constructor() {
     this.rules = new Map();
-    this.setupDefaultRules();
+    this.loadRules();
   }
 
-  setupDefaultRules() {
-    // Regla para filtrar registros inactivos
-    this.addRule('clientes', 'estatus', (data, operation) => {
-      if (data.status === 'inactive' && operation === 'INSERT') {
-        return null; // Filtrar registro
-      }
-      return data;
-    });
+  loadRules() {
+    try {
+      const rulesPath = path.join(__dirname, 'rules');
+      const ruleFiles = fs.readdirSync(rulesPath)
+        .filter(file => file.endsWith('Rules.js') && file !== 'baseRule.js');
 
-    // Regla para transformar datos
-    this.addRule('clientes', 'estatus', (data, operation) => {
-      if (data.status && operation !== 'DELETE') {
-        data.status = 2
-      }
-      return data;
-    });
+      ruleFiles.forEach(file => {
+        try {
+          const RuleClass = require(`./rules/${file}`);
+          const tableName = file.replace('Rules.js', '').toLowerCase();
+          const ruleInstance = new RuleClass();
 
-    this.addRule('Empleados', 'PassKiosko', (data, operation) => {
-      if (data.status && operation !== 'UPDATE') {
-        data.status = 2
-      }
-      return data;
-    });
-
-    // Regla para auditoría
-    this.addRule('*', 'estatus', (data, operation) => {
-      if (operation !== 'DELETE') {
-        data.modifica = new Date().toISOString();
-        data.status = 2;
-      }
-      return data;
-    });
+          this.rules.set(tableName, ruleInstance.getRules());
+          logger.info(`Reglas cargadas para la tabla: ${tableName}`);
+        } catch (error) {
+          logger.error(`Error cargando reglas de ${file}:`, error);
+        }
+      });
+    } catch (error) {
+      logger.error('Error al cargar las reglas:', error);
+    }
   }
 
   addRule(tableName, ruleName, ruleFunction) {
@@ -52,7 +43,7 @@ class BusinessRules {
     let processedData = { ...data };
 
     // Aplicar reglas específicas de la tabla
-    const tableRules = this.rules.get(tableName);
+    const tableRules = this.rules.get(tableName.toLowerCase());
     if (tableRules) {
       for (const [ruleName, ruleFunction] of tableRules) {
         try {
