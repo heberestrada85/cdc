@@ -3,8 +3,11 @@ const { Request, TYPES } = require('tedious');
 const logger = require('../utils/logger');
 
 class CDCService {
-  constructor(connection) {
-    this.connection = connection;
+  /**
+   * @param {Object} connectionRunner - Instancia de ConnectionRunner (no la conexión raw)
+   */
+  constructor(connectionRunner) {
+    this.connectionRunner = connectionRunner;
     this.lastLSN = null;
     this.cdcTables = new Map();
   }
@@ -21,12 +24,12 @@ class CDCService {
       END
     `;
 
-    return this.executeQuery(query);
+    return this.connectionRunner.query(query);
   }
 
   async getLastLSN() {
     const query = 'SELECT sys.fn_cdc_get_max_lsn() AS max_lsn';
-    const result = await this.executeQuery(query);
+    const result = await this.connectionRunner.query(query);
     return result[0]?.max_lsn;
   }
 
@@ -54,7 +57,7 @@ class CDCService {
       ORDER BY __$start_lsn, __$seqval
     `;
 
-    return this.executeQuery(query, [
+    return this.connectionRunner.query(query, [
       { name: 'from_lsn', type: TYPES.Binary, value: fromLSN },
       { name: 'to_lsn', type: TYPES.Binary, value: toLSN },
       { name: 'row_filter', type: TYPES.NVarChar, value: 'all' }
@@ -65,45 +68,8 @@ class CDCService {
     const query = `
       SELECT sys.fn_cdc_get_min_lsn('${schemaName}_${tableName}') AS min_lsn
     `;
-    const result = await this.executeQuery(query);
+    const result = await this.connectionRunner.query(query);
     return result[0]?.min_lsn;
-  }
-
-  async executeQuery(query, parameters = []) {
-    return new Promise((resolve, reject) => {
-      const request = new Request(query, (err, rowCount) => {
-        if (err) {
-          reject(err);
-        }
-      });
-
-      const results = [];
-      request.on('row', (columns) => {
-        const row = {};
-        //console.log('[DEBUG] columns:', JSON.stringify(columns, null, 2));
-
-        Object.entries(columns).forEach(([key, col]) => {
-          const value = col.value;
-          const metadata = col.metadata;
-          //console.log(`Column: ${key}, Value: ${value}, Type: ${metadata.type.name}`);
-        });
-
-        Object.values(columns).forEach(column => {
-          row[column.metadata.colName] = column.value;
-        });
-        results.push(row);
-      });
-
-      request.on('requestCompleted', () => {
-        resolve(results);
-      });
-
-      parameters.forEach(param => {
-        request.addParameter(param.name, param.type, param.value);
-      });
-
-      this.connection.execSql(request);
-    });
   }
 
   interpretOperation(operationCode) {

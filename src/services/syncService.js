@@ -11,6 +11,7 @@ class SyncService {
     this.syncState = new Map();
     this.syncLocks = new Map(); // Lock para evitar MERGE simultáneos
     this.processId = `PID-${process.pid}-${Date.now()}`; // ID único para este proceso
+    this.nonExistentSourceTables = new Set(); // Cache de tablas que no existen en origen
   }
 
   /**
@@ -41,6 +42,20 @@ class SyncService {
       // No fallar si el log falla, solo registrar el error
       logger.debug(`Error escribiendo en CDC_SyncLog: ${error.message}`);
     }
+  }
+
+  /**
+   * Verifica si la tabla existe en la base de datos origen
+   */
+  async checkSourceTableExists(tableName, schemaName) {
+    const query = `
+      SELECT COUNT(*) as count
+      FROM sys.tables
+      WHERE schema_id = SCHEMA_ID('${schemaName}')
+        AND name = '${tableName}'
+    `;
+    const result = await this.sourceConnection.query(query);
+    return result[0]?.count > 0;
   }
 
   async ensureCDCEnabled(tableName, schemaName) {
@@ -92,18 +107,204 @@ class SyncService {
   async isTargetTableEmpty(tableName, schemaName) {
     const query = `SELECT TOP 1 1 as existsFlag FROM ${schemaName}.${tableName}`;
     const result = await this.targetConnection.query(query);
-    console.log('[DEBUG] isTargetTableEmpty query:', result);
     return result.length === 0;
+  }
+
+  /**
+   * Verifica si la tabla destino existe
+   */
+  async checkTargetTableExists(tableName, schemaName) {
+    const query = `
+      SELECT COUNT(*) as count
+      FROM INFORMATION_SCHEMA.TABLES
+      WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
+    `;
+    const result = await this.targetConnection.query(query);
+    return result[0]?.count > 0;
+  }
+
+  /**
+   * Verifica si la función CDC existe para una tabla
+   */
+  async checkCDCFunctionExists(tableName, schemaName) {
+    const query = `
+      SELECT COUNT(*) as count
+      FROM sys.objects
+      WHERE name = 'fn_cdc_get_all_changes_${schemaName}_${tableName}'
+        AND type = 'IF'
+        AND schema_id = SCHEMA_ID('cdc')
+    `;
+    const result = await this.sourceConnection.query(query);
+    return result[0]?.count > 0;
   }
 
 
   async snapshotInitial(tableName, schemaName) {
-    logger.info(`Realizando sincronización inicial (MERGE) para ${schemaName}.${tableName}...`);
+    const startTime = Date.now();
+    logger.info(`Realizando snapshot inicial para ${schemaName}.${tableName}...`);
 
-    // Obtener la clave primaria de la tabla
+    // Copiar todos los datos de origen a destino
+    await this.bulkInsertAll(tableName, schemaName);
+
+    const totalTime = Date.now() - startTime;
+    logger.info(`Snapshot inicial completado para ${schemaName}.${tableName} en ${totalTime}ms`);
+  }
+
+  /**
+   * Bulk insert masivo - Copia datos de origen a destino usando paginación
+   * para evitar problemas de memoria
+   */
+  async bulkInsertAll(tableName, schemaName) {
+    const startTime = Date.now();
+    logger.info(`Ejecutando BULK INSERT masivo para ${schemaName}.${tableName}...`);
+
+    // Obtener la clave primaria
     const primaryKey = await this.getPrimaryKey(tableName, schemaName);
 
-    // Obtener todos los registros de la tabla origen
+    if (!primaryKey) {
+      logger.warn(`No se encontró clave primaria para ${schemaName}.${tableName}, usando inserción individual`);
+      return this.mergeInitial(tableName, schemaName);
+    }
+
+    // Obtener el total de registros
+    const countResult = await this.sourceConnection.query(
+      `SELECT COUNT(*) as total FROM ${schemaName}.${tableName}`
+    );
+    const totalRows = countResult[0]?.total || 0;
+
+    if (totalRows === 0) {
+      logger.info(`No hay registros en origen para ${schemaName}.${tableName}`);
+      return;
+    }
+
+    logger.info(`Total de registros a copiar ${schemaName}.${tableName}: ${totalRows}`);
+
+    // Obtener columnas de la tabla
+    const columnsResult = await this.sourceConnection.query(`
+      SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
+    `);
+    const columns = columnsResult.map(c => c.COLUMN_NAME);
+
+    // Lista de columnas binarias conocidas
+    const binaryCols = new Set([
+      'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
+      'CardChecador', 'passChecador'
+    ]);
+
+    // Función para formatear un valor SQL
+    const formatValue = (col, v) => {
+      if (binaryCols.has(col)) {
+        if (Buffer.isBuffer(v)) {
+          if (v.length === 0) return 'NULL';
+          return `CONVERT(varbinary(max), '0x${v.toString('hex')}', 1)`;
+        } else if (typeof v === 'string') {
+          if (!v || v === '' || v === '0x') return 'NULL';
+          let hexStr = v.startsWith('0x') ? v.substring(2) : v;
+          if (!/^[0-9a-fA-F]*$/.test(hexStr)) return 'NULL';
+          if (hexStr.length % 2 !== 0) hexStr = '0' + hexStr;
+          return `CONVERT(varbinary(max), '0x${hexStr}', 1)`;
+        } else if (v == null) {
+          return 'NULL';
+        }
+      }
+
+      if (v === null || v === undefined) return 'NULL';
+      if (v instanceof Date) return `'${v.toISOString()}'`;
+      if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`;
+      if (typeof v === 'number') return v;
+      if (typeof v === 'boolean') return v ? '1' : '0';
+      return `'${v}'`;
+    };
+
+    // Procesar en páginas para no cargar todo en memoria
+    const PAGE_SIZE = 500;   // Registros por página de lectura (reducido para evitar OOM)
+    const BATCH_SIZE = 100;  // Registros por INSERT (reducido para evitar OOM)
+    let insertedCount = 0;
+    let errorCount = 0;
+    let offset = 0;
+
+    while (offset < totalRows) {
+      // Obtener una página de datos
+      const pageQuery = `
+        SELECT * FROM ${schemaName}.${tableName}
+        ORDER BY ${primaryKey}
+        OFFSET ${offset} ROWS FETCH NEXT ${PAGE_SIZE} ROWS ONLY
+      `;
+
+      const rows = await this.sourceConnection.query(pageQuery);
+
+      if (rows.length === 0) break;
+
+      // Procesar la página en batches
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, i + BATCH_SIZE);
+
+        // Aplicar reglas de negocio y filtrar
+        const processedBatch = [];
+        for (const row of batch) {
+          const processedData = await this.businessRules.applyRules(row, tableName, 'INSERT');
+          if (processedData) {
+            processedBatch.push(processedData);
+          }
+        }
+
+        if (processedBatch.length === 0) continue;
+
+        // Construir VALUES para el batch
+        const valueRows = processedBatch.map(row => {
+          const values = columns.map(col => formatValue(col, row[col]));
+          return `(${values.join(', ')})`;
+        });
+
+        const query = `
+          SET IDENTITY_INSERT ${schemaName}.${tableName} ON;
+          INSERT INTO ${schemaName}.${tableName} (${columns.join(', ')})
+          VALUES ${valueRows.join(',\n')};
+          SET IDENTITY_INSERT ${schemaName}.${tableName} OFF;
+        `;
+
+        try {
+          await this.targetConnection.exec(query);
+          insertedCount += processedBatch.length;
+        } catch (error) {
+          logger.error(`Error en batch (offset ${offset + i}):`, error.message);
+
+          // Fallback: insertar uno por uno
+          for (const row of processedBatch) {
+            try {
+              await this.handleInsert(row, tableName, schemaName);
+              insertedCount++;
+            } catch (individualError) {
+              errorCount++;
+              logger.debug(`Error insertando registro ${row[primaryKey]}:`, individualError.message);
+            }
+          }
+        }
+      }
+
+      logger.info(`Progreso ${schemaName}.${tableName}: ${Math.min(offset + PAGE_SIZE, totalRows)}/${totalRows} registros procesados`);
+      offset += PAGE_SIZE;
+
+      // Liberar memoria explícitamente
+      if (global.gc) global.gc();
+    }
+
+    const totalTime = Date.now() - startTime;
+    await this.writeLog(tableName, 'BULK_INSERT', null, 'SUCCESS',
+      `Bulk insert completado: ${insertedCount} insertados, ${errorCount} errores en ${totalTime}ms`,
+      null, { totalRows, inserted: insertedCount, errors: errorCount }, totalTime);
+
+    logger.info(`BULK INSERT completado para ${schemaName}.${tableName}: ${insertedCount} registros en ${totalTime}ms`);
+  }
+
+  /**
+   * Merge inicial - Para cuando la tabla destino ya tiene datos
+   */
+  async mergeInitial(tableName, schemaName) {
+    logger.info(`Ejecutando MERGE inicial para ${schemaName}.${tableName} (tabla con datos existentes)...`);
+
+    const primaryKey = await this.getPrimaryKey(tableName, schemaName);
     const rows = await this.sourceConnection.query(`SELECT * FROM ${schemaName}.${tableName}`);
 
     logger.info(`Total de registros en origen: ${rows.length}`);
@@ -114,86 +315,49 @@ class SyncService {
     let errorCount = 0;
 
     for (const row of rows) {
-      const startTime = Date.now();
       let pkValue = null;
 
       try {
-        // Aplicar reglas de negocio
         const processedData = await this.businessRules.applyRules(row, tableName, 'INSERT');
         if (!processedData) {
-          logger.debug(`Registro filtrado por reglas de negocio en snapshot para ${tableName}`);
           skipCount++;
           continue;
         }
 
-        // Verificar si el registro ya existe en destino
         pkValue = processedData[primaryKey];
-
-        // Usar query directa sin parámetros para evitar problemas
         const existsQuery = `SELECT COUNT(*) as count FROM ${schemaName}.${tableName} WHERE ${primaryKey} = ${pkValue}`;
         const existsResult = await this.targetConnection.query(existsQuery);
 
-        logger.debug(`Verificando registro ${primaryKey}=${pkValue}, existe: ${existsResult[0]?.count > 0}`);
-
         if (existsResult[0]?.count > 0) {
-          // El registro existe → verificar si necesita UPDATE
           const currentQuery = `SELECT * FROM ${schemaName}.${tableName} WHERE ${primaryKey} = ${pkValue}`;
           const currentResult = await this.targetConnection.query(currentQuery);
 
           if (!currentResult || currentResult.length === 0) {
-            logger.warn(`Registro ${primaryKey}=${pkValue} reportado como existente pero no se pudo obtener. Insertando...`);
             await this.handleInsert(processedData, tableName, schemaName);
             insertCount++;
-
-            const timeElapsed = Date.now() - startTime;
-            await this.writeLog(tableName, 'INSERT', pkValue, 'SUCCESS',
-              'Registro insertado después de verificación fallida', null, processedData, timeElapsed);
             continue;
           }
 
           const currentData = currentResult[0];
-
-          // Comparar campos (excluir campos de control como modifica, estatus)
           const needsUpdate = this.compareRecords(processedData, currentData, [primaryKey, 'modifica', 'estatus']);
 
           if (needsUpdate) {
             await this.handleUpdate(processedData, tableName, schemaName);
             updateCount++;
-            logger.info(`✓ Registro ${primaryKey}=${pkValue} actualizado`);
-
-            const timeElapsed = Date.now() - startTime;
-            await this.writeLog(tableName, 'UPDATE', pkValue, 'SUCCESS',
-              'Registro actualizado con cambios detectados', currentData, processedData, timeElapsed);
           } else {
             skipCount++;
-            logger.debug(`Registro ${primaryKey}=${pkValue} ya está actualizado`);
-
-            const timeElapsed = Date.now() - startTime;
-            await this.writeLog(tableName, 'SKIP', pkValue, 'SKIPPED',
-              'Registro sin cambios, omitido', null, null, timeElapsed);
           }
         } else {
-          // El registro NO existe → INSERT
           await this.handleInsert(processedData, tableName, schemaName);
           insertCount++;
-          logger.info(`✓ Registro ${primaryKey}=${pkValue} insertado`);
-
-          const timeElapsed = Date.now() - startTime;
-          await this.writeLog(tableName, 'INSERT', pkValue, 'SUCCESS',
-            'Registro insertado correctamente', null, processedData, timeElapsed);
         }
       } catch (error) {
         errorCount++;
-        logger.error(`Error procesando registro ${pkValue || row[primaryKey]} en snapshot para ${tableName}:`, error);
-
-        const timeElapsed = Date.now() - startTime;
-        await this.writeLog(tableName, 'ERROR', pkValue || row[primaryKey], 'ERROR',
-          error.message, row, null, timeElapsed);
-        // Continuar con el siguiente registro
+        logger.error(`Error procesando registro ${pkValue || row[primaryKey]}:`, error.message);
       }
     }
 
-    logger.info(`Sincronización inicial completada para ${schemaName}.${tableName}: ${insertCount} insertados, ${updateCount} actualizados, ${skipCount} omitidos, ${errorCount} errores`);
+    logger.info(`MERGE inicial completado: ${insertCount} insertados, ${updateCount} actualizados, ${skipCount} omitidos, ${errorCount} errores`);
   }
 
   // Método auxiliar para comparar dos registros
@@ -238,60 +402,104 @@ class SyncService {
       return;
     }
 
+    // ⏭️ Si ya sabemos que la tabla no existe en origen, omitir silenciosamente
+    if (this.nonExistentSourceTables.has(tableKey)) {
+      return;
+    }
+
     // Establecer el lock
     this.syncLocks.set(tableKey, true);
 
     try {
+      // 0️⃣ Verificar si la tabla existe en origen
+      const sourceTableExists = await this.checkSourceTableExists(tableName, schemaName);
+      if (!sourceTableExists) {
+        // Agregar al cache para no repetir el mensaje
+        this.nonExistentSourceTables.add(tableKey);
+        logger.warn(`⚠️  Tabla ${tableKey} NO EXISTE en la base de datos origen. Omitiendo...`);
+        return;
+      }
+
       // 1️⃣ Asegurar que CDC esté habilitado en la tabla origen
       await this.ensureCDCEnabled(tableName, schemaName);
 
-      // 2️⃣ Asegurar que la tabla destino exista con estructura correcta
-      await this.ensureTableAndColumnsExist(tableName, schemaName, {});
+      // 2️⃣ Verificar si la tabla destino existe
+      const targetTableExists = await this.checkTargetTableExists(tableName, schemaName);
 
-      // 3️⃣ Verificar si ya se hizo la sincronización inicial
-      const initialSyncKey = `${tableKey}_initial_sync_done`;
-      const initialSyncDone = this.syncState.get(initialSyncKey);
-
-      if (!initialSyncDone) {
-        // Primera ejecución: hacer MERGE completo (INSERT/UPDATE)
-        logger.info(`Primera sincronización para ${tableKey} → ejecutando MERGE inicial`);
+      if (!targetTableExists) {
+        // La tabla NO existe → crearla y migrar TODOS los datos
+        logger.info(`Tabla ${tableKey} no existe en destino → creando estructura y migrando datos`);
+        await this.ensureTableAndColumnsExist(tableName, schemaName, {});
         await this.snapshotInitial(tableName, schemaName);
 
-        // Marcar como sincronizado inicialmente
-        this.syncState.set(initialSyncKey, true);
-
-        // Guardar el LSN actual para futuros ciclos CDC
+        // Marcar como sincronizado y guardar LSN actual
+        this.syncState.set(`${tableKey}_initial_sync_done`, true);
         const CDCService = require('../config/cdcService');
-        const cdcService = new CDCService(this.sourceConnection.conn);
+        const cdcService = new CDCService(this.sourceConnection);
+        const currentLSN = await cdcService.getLastLSN();
+        if (currentLSN) {
+          this.syncState.set(tableKey, currentLSN);
+          logger.info(`Tabla ${tableKey} migrada. LSN guardado, CDC activo desde ahora`);
+        }
+        return;
+      }
+
+      // 3️⃣ La tabla existe → asegurar columnas y continuar con CDC
+      await this.ensureTableAndColumnsExist(tableName, schemaName, {});
+
+      // Marcar como sincronizado si no lo está (para tablas que ya existían)
+      const initialSyncKey = `${tableKey}_initial_sync_done`;
+      if (!this.syncState.get(initialSyncKey)) {
+        this.syncState.set(initialSyncKey, true);
+        logger.info(`Tabla ${tableKey} ya existe en destino → omitiendo snapshot, usando CDC`);
+
+        // Guardar LSN actual para empezar a capturar cambios desde ahora
+        const CDCService = require('../config/cdcService');
+        const cdcService = new CDCService(this.sourceConnection);
         const currentLSN = await cdcService.getLastLSN();
         if (currentLSN) {
           this.syncState.set(tableKey, currentLSN);
           logger.info(`LSN inicial guardado para ${tableKey}`);
         }
-
-        return; // No procesar CDC en este primer ciclo
       }
 
       // 4️⃣ Ciclos posteriores: procesar solo cambios CDC
       const CDCService = require('../config/cdcService');
-      const cdcService = new CDCService(this.sourceConnection.conn);
-      const lastProcessedLSN = this.syncState.get(tableKey) || null;
+      const cdcService = new CDCService(this.sourceConnection);
 
-      const changes = await cdcService.getTableChanges(tableName, schemaName, lastProcessedLSN);
-
-      if (changes.length === 0) {
-        logger.debug(`No hay cambios CDC para ${tableKey}`);
+      // Verificar si la función CDC existe para esta tabla
+      const cdcFunctionExists = await this.checkCDCFunctionExists(tableName, schemaName);
+      if (!cdcFunctionExists) {
+        logger.debug(`Función CDC no existe aún para ${tableKey}, omitiendo ciclo CDC`);
         return;
       }
 
-      logger.info(`Procesando ${changes.length} cambios CDC para ${tableKey}`);
+      const lastProcessedLSN = this.syncState.get(tableKey) || null;
 
-      for (const change of changes) {
-        await this.processChange(change, tableName, schemaName);
-        this.syncState.set(tableKey, change.start_lsn);
+      try {
+        const changes = await cdcService.getTableChanges(tableName, schemaName, lastProcessedLSN);
+
+        if (changes.length === 0) {
+          logger.debug(`No hay cambios CDC para ${tableKey}`);
+          return;
+        }
+
+        logger.info(`Procesando ${changes.length} cambios CDC para ${tableKey}`);
+
+        for (const change of changes) {
+          await this.processChange(change, tableName, schemaName);
+          this.syncState.set(tableKey, change.start_lsn);
+        }
+
+        logger.info(`Sincronización CDC completada para ${tableKey}`);
+      } catch (cdcError) {
+        // Si la función CDC no existe, solo logueamos y continuamos
+        if (cdcError.message && cdcError.message.includes('Invalid object name')) {
+          logger.warn(`Función CDC aún no disponible para ${tableKey}, se reintentará en el próximo ciclo`);
+          return;
+        }
+        throw cdcError;
       }
-
-      logger.info(`Sincronización CDC completada para ${tableKey}`);
     } catch (error) {
       logger.error(`Error sincronizando tabla ${schemaName}.${tableName}:`, error);
       throw error;
@@ -377,8 +585,6 @@ class SyncService {
         VALUES (${valuesList.join(', ')});
         SET IDENTITY_INSERT ${schemaName}.${tableName} OFF;
       `;
-
-      console.log('Executing INSERT:\n', query);
 
       await this.executeTargetQuery(query);
       logger.debug(`INSERT ejecutado para ${tableName}`);
@@ -638,8 +844,6 @@ class SyncService {
         });
         return q;
       };
-      console.log('Executing UPDATE:\n', prettyQuery(query, values));
-
       // 8) Ejecuta (tu ejecutor enviará NVARCHAR, por eso usamos CONVERT en SQL)
       await this.executeTargetQuery(prettyQuery(query, values));
       logger.debug(`UPDATE ejecutado para ${tableName}`);
@@ -735,10 +939,10 @@ class SyncService {
 
       this.targetConnection.on('connect', (err) => {
         if (err) {
-          console.error('Error reconnecting to target database:', err);
+          logger.error('Error reconnecting to target database:', err);
           reject(err);
         } else {
-          console.log('Successfully reconnected to target database');
+          logger.info('Successfully reconnected to target database');
           resolve();
         }
       });
@@ -894,7 +1098,7 @@ class SyncService {
         )
       `;
 
-      console.log('Creating table with query:\n', createTableQuery);
+      logger.debug(`Creando tabla ${schemaName}.${tableName}`);
       await this.targetConnection.exec(createTableQuery);
       logger.info(`Tabla ${schemaName}.${tableName} creada exitosamente`);
       return;
