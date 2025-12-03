@@ -12,6 +12,7 @@ class SyncService {
     this.syncLocks = new Map(); // Lock para evitar MERGE simultáneos
     this.processId = `PID-${process.pid}-${Date.now()}`; // ID único para este proceso
     this.nonExistentSourceTables = new Set(); // Cache de tablas que no existen en origen
+    this.tablesWithoutPrimaryKey = new Set(); // Cache de tablas sin clave primaria
   }
 
   /**
@@ -305,6 +306,12 @@ class SyncService {
     logger.info(`Ejecutando MERGE inicial para ${schemaName}.${tableName} (tabla con datos existentes)...`);
 
     const primaryKey = await this.getPrimaryKey(tableName, schemaName);
+
+    if (!primaryKey) {
+      logger.warn(`⚠️  Tabla ${schemaName}.${tableName} no tiene clave primaria (IDENTITY). Omitiendo sincronización...`);
+      return;
+    }
+
     const rows = await this.sourceConnection.query(`SELECT * FROM ${schemaName}.${tableName}`);
 
     logger.info(`Total de registros en origen: ${rows.length}`);
@@ -407,6 +414,11 @@ class SyncService {
       return;
     }
 
+    // ⏭️ Si ya sabemos que la tabla no tiene clave primaria, omitir silenciosamente
+    if (this.tablesWithoutPrimaryKey.has(tableKey)) {
+      return;
+    }
+
     // Establecer el lock
     this.syncLocks.set(tableKey, true);
 
@@ -417,6 +429,15 @@ class SyncService {
         // Agregar al cache para no repetir el mensaje
         this.nonExistentSourceTables.add(tableKey);
         logger.warn(`⚠️  Tabla ${tableKey} NO EXISTE en la base de datos origen. Omitiendo...`);
+        return;
+      }
+
+      // 0.5️⃣ Verificar si la tabla tiene clave primaria (IDENTITY)
+      const primaryKey = await this.getPrimaryKey(tableName, schemaName);
+      if (!primaryKey) {
+        // Agregar al cache para no repetir el mensaje
+        this.tablesWithoutPrimaryKey.add(tableKey);
+        logger.warn(`⚠️  Tabla ${tableKey} NO TIENE clave primaria (IDENTITY). Omitiendo...`);
         return;
       }
 
