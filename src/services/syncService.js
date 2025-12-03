@@ -1254,15 +1254,63 @@ class ConnectionRunner {
     this._queue = Promise.resolve();
     this._isConnecting = false;
 
+    // Configuración de reintentos
+    this.MAX_RETRIES = 5;
+    this.BASE_DELAY_MS = 1000;  // 1 segundo inicial
+    this.MAX_DELAY_MS = 30000;  // máximo 30 segundos
+
     // engancha eventos si viene conexión viva
     if (this.conn) this._attachEvents(this.conn);
   }
 
   _attachEvents(conn) {
-    conn.on('end', () => this.logger?.warn?.(`[${this.name}] conexión END`));
-    conn.on('error', (err) => this.logger?.error?.(
-      `[${this.name}] error de conexión: ${err && err.message}`
-    ));
+    conn.on('end', () => {
+      this.logger?.warn?.(`[${this.name}] conexión END - se reestablecerá automáticamente`);
+      this.conn = null; // Marcar como desconectado para forzar reconexión
+    });
+    conn.on('error', (err) => {
+      this.logger?.error?.(`[${this.name}] error de conexión: ${err && err.message}`);
+      this.conn = null; // Marcar como desconectado para forzar reconexión
+    });
+  }
+
+  /**
+   * Verifica si un error es de conexión y se puede reintentar
+   */
+  _isConnectionError(err) {
+    if (!err) return false;
+    const message = err.message?.toLowerCase() || '';
+    const code = err.code?.toLowerCase() || '';
+
+    return (
+      message.includes('connection') ||
+      message.includes('socket') ||
+      message.includes('timeout') ||
+      message.includes('econnreset') ||
+      message.includes('econnrefused') ||
+      message.includes('epipe') ||
+      message.includes('network') ||
+      message.includes('closed') ||
+      message.includes('not connected') ||
+      message.includes('loggedin') ||
+      code === 'esocket' ||
+      code === 'econnreset' ||
+      code === 'econnrefused' ||
+      code === 'etimedout'
+    );
+  }
+
+  /**
+   * Calcula el delay con backoff exponencial
+   */
+  _getRetryDelay(attempt) {
+    const delay = Math.min(
+      this.BASE_DELAY_MS * Math.pow(2, attempt),
+      this.MAX_DELAY_MS
+    );
+    // Agregar jitter aleatorio (±20%)
+    const jitter = delay * 0.2 * (Math.random() - 0.5);
+    return Math.floor(delay + jitter);
   }
 
   async _ensureConnected() {
@@ -1276,41 +1324,72 @@ class ConnectionRunner {
     }
 
     this._isConnecting = true;
-    try {
-      // si había una conexión rota, deséchala
-      this.conn = null;
 
-      const cfg = {
-        server: this.config.server,
-        authentication: {
-          type: 'default',
-          options: { userName: this.config.userName, password: this.config.password },
-        },
-        options: {
-          database: this.config.database,
-          encrypt: false,
-          trustServerCertificate: true,
-          appName: `cdc-sync-${this.name}`,
-        },
-      };
+    let lastError = null;
 
-      this.logger?.info?.(`[${this.name}] conectando a ${cfg.server}/${cfg.options.database}...`);
+    for (let attempt = 0; attempt < this.MAX_RETRIES; attempt++) {
+      try {
+        // si había una conexión rota, deséchala
+        if (this.conn) {
+          try {
+            this.conn.close();
+          } catch (e) {
+            // Ignorar errores al cerrar
+          }
+        }
+        this.conn = null;
 
-      this.conn = new Connection(cfg);
-      this._attachEvents(this.conn);
+        const cfg = {
+          server: this.config.server,
+          authentication: {
+            type: 'default',
+            options: { userName: this.config.userName, password: this.config.password },
+          },
+          options: {
+            database: this.config.database,
+            encrypt: false,
+            trustServerCertificate: true,
+            appName: `cdc-sync-${this.name}`,
+            connectTimeout: 30000,      // 30 segundos timeout de conexión
+            requestTimeout: 300000,     // 5 minutos timeout de request
+          },
+        };
 
-      await new Promise((resolve, reject) => {
-        this.conn.on('connect', (err) => err ? reject(err) : resolve());
-      });
+        if (attempt > 0) {
+          this.logger?.warn?.(`[${this.name}] reintento ${attempt}/${this.MAX_RETRIES - 1} conectando a ${cfg.server}/${cfg.options.database}...`);
+        } else {
+          this.logger?.info?.(`[${this.name}] conectando a ${cfg.server}/${cfg.options.database}...`);
+        }
 
-      if (this.conn.state.name !== 'LoggedIn') {
-        throw new Error(`Estado ${this.conn.state.name}, no LoggedIn`);
+        this.conn = new Connection(cfg);
+        this._attachEvents(this.conn);
+
+        await new Promise((resolve, reject) => {
+          this.conn.on('connect', (err) => err ? reject(err) : resolve());
+        });
+
+        if (this.conn.state.name !== 'LoggedIn') {
+          throw new Error(`Estado ${this.conn.state.name}, no LoggedIn`);
+        }
+
+        this.logger?.info?.(`[${this.name}] conectado exitosamente`);
+        this._isConnecting = false;
+        return; // Conexión exitosa
+
+      } catch (err) {
+        lastError = err;
+        this.logger?.error?.(`[${this.name}] error de conexión (intento ${attempt + 1}/${this.MAX_RETRIES}): ${err.message}`);
+
+        if (attempt < this.MAX_RETRIES - 1) {
+          const delay = this._getRetryDelay(attempt);
+          this.logger?.info?.(`[${this.name}] esperando ${delay}ms antes de reintentar...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
-
-      this.logger?.info?.(`[${this.name}] conectado`);
-    } finally {
-      this._isConnecting = false;
     }
+
+    this._isConnecting = false;
+    throw new Error(`[${this.name}] No se pudo conectar después de ${this.MAX_RETRIES} intentos. Último error: ${lastError?.message}`);
   }
 
   // Serializa tareas en la cola
@@ -1323,51 +1402,89 @@ class ConnectionRunner {
     });
   }
 
+  /**
+   * Ejecuta una operación con reintentos automáticos si hay error de conexión
+   */
+  async _executeWithRetry(operation, operationType = 'query') {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < this.MAX_RETRIES; attempt++) {
+      try {
+        await this._ensureConnected();
+        return await operation();
+      } catch (err) {
+        lastError = err;
+
+        if (this._isConnectionError(err)) {
+          this.logger?.warn?.(`[${this.name}] error de conexión en ${operationType} (intento ${attempt + 1}/${this.MAX_RETRIES}): ${err.message}`);
+
+          // Marcar conexión como inválida
+          this.conn = null;
+
+          if (attempt < this.MAX_RETRIES - 1) {
+            const delay = this._getRetryDelay(attempt);
+            this.logger?.info?.(`[${this.name}] esperando ${delay}ms antes de reintentar ${operationType}...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        }
+
+        // Si no es error de conexión o ya no hay más reintentos, propagar el error
+        throw err;
+      }
+    }
+
+    throw lastError;
+  }
+
   // SELECT o DDL que devuelve filas
   async query(sql, params = []) {
     return this._run(async () => {
-      await this._ensureConnected();
-      return new Promise((resolve, reject) => {
-        const rows = [];
-        let req;
-        if (typeof sql !== 'string')
-          req = sql;
-        else{
-          req = new Request(sql, (err) => err ? reject(err) : resolve(rows));
-          params.forEach(p => req.addParameter(p.name, p.type, p.value));
-          req.on('row', cols => {
-            const o = {};
-            Object.values(cols).forEach(c => o[c.metadata.colName] = c.value);
-            rows.push(o);
-          });
-        }
-        this.conn.execSql(req);
-      });
+      return this._executeWithRetry(async () => {
+        return new Promise((resolve, reject) => {
+          const rows = [];
+          let req;
+          if (typeof sql !== 'string')
+            req = sql;
+          else {
+            req = new Request(sql, (err) => err ? reject(err) : resolve(rows));
+            params.forEach(p => req.addParameter(p.name, p.type, p.value));
+            req.on('row', cols => {
+              const o = {};
+              Object.values(cols).forEach(c => o[c.metadata.colName] = c.value);
+              rows.push(o);
+            });
+          }
+          this.conn.execSql(req);
+        });
+      }, 'query');
     });
   }
 
   // DML (INSERT/UPDATE/DELETE) o cualquier non-query
   async exec(sql, params = []) {
     return this._run(async () => {
-      await this._ensureConnected();
-      return new Promise((resolve, reject) => {
-        const req = new Request(sql, (err, rowCount) => err ? reject(err) : resolve(rowCount));
-        params.forEach(p => req.addParameter(p.name, p.type, p.value));
-        this.conn.execSql(req);
-      });
+      return this._executeWithRetry(async () => {
+        return new Promise((resolve, reject) => {
+          const req = new Request(sql, (err, rowCount) => err ? reject(err) : resolve(rowCount));
+          params.forEach(p => req.addParameter(p.name, p.type, p.value));
+          this.conn.execSql(req);
+        });
+      }, 'exec');
     });
   }
 
   // Ejecutar un Request pre-armado (útil para parámetros tipados dinámicos)
   async execRequest(requestFactory) {
     return this._run(async () => {
-      await this._ensureConnected();
-      const req = requestFactory(Request, TYPES);
-      return new Promise((resolve, reject) => {
-        this.conn.execSql(req);
-        req.on('requestCompleted', resolve);
-        req.on('error', reject);
-      });
+      return this._executeWithRetry(async () => {
+        const req = requestFactory(Request, TYPES);
+        return new Promise((resolve, reject) => {
+          this.conn.execSql(req);
+          req.on('requestCompleted', resolve);
+          req.on('error', reject);
+        });
+      }, 'execRequest');
     });
   }
 }
