@@ -34,6 +34,16 @@ class CDCService {
   }
 
   async getTableChanges(tableName, schemaName = 'dbo', fromLSN = null, toLSN = null) {
+    // Si tenemos un fromLSN (último procesado), necesitamos incrementarlo
+    // para no re-procesar el mismo cambio
+    if (fromLSN) {
+      const incrementResult = await this.connectionRunner.query(
+        'SELECT sys.fn_cdc_increment_lsn(@lsn) AS next_lsn',
+        [{ name: 'lsn', type: TYPES.Binary, value: fromLSN }]
+      );
+      fromLSN = incrementResult[0]?.next_lsn;
+    }
+
     if (!fromLSN) {
       fromLSN = await this.getMinValidLSN(tableName, schemaName);
     }
@@ -44,6 +54,18 @@ class CDCService {
     // Si alguno de los LSN sigue nulo, no se puede llamar
     if (!fromLSN || !toLSN) {
       throw new Error(`No se pudo obtener LSN válido para ${schemaName}.${tableName}`);
+    }
+
+    // Si fromLSN > toLSN, no hay cambios nuevos
+    const compareResult = await this.connectionRunner.query(
+      'SELECT CASE WHEN @from_lsn > @to_lsn THEN 1 ELSE 0 END AS is_greater',
+      [
+        { name: 'from_lsn', type: TYPES.Binary, value: fromLSN },
+        { name: 'to_lsn', type: TYPES.Binary, value: toLSN }
+      ]
+    );
+    if (compareResult[0]?.is_greater === 1) {
+      return []; // No hay cambios nuevos
     }
 
     const query = `

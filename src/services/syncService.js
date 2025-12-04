@@ -13,6 +13,7 @@ class SyncService {
     this.processId = `PID-${process.pid}-${Date.now()}`; // ID único para este proceso
     this.nonExistentSourceTables = new Set(); // Cache de tablas que no existen en origen
     this.tablesWithoutPrimaryKey = new Set(); // Cache de tablas sin clave primaria
+    this.tablesColumnsVerified = new Set(); // Cache de tablas cuyas columnas ya fueron verificadas
   }
 
   /**
@@ -978,6 +979,13 @@ class SyncService {
   }
 
   async ensureTableAndColumnsExist(tableName, schemaName, data) {
+    const tableKey = `${schemaName}.${tableName}`;
+
+    // ⏭️ Si ya verificamos las columnas de esta tabla, saltar
+    if (this.tablesColumnsVerified.has(tableKey)) {
+      return;
+    }
+
     // 1️⃣ Verificar si la tabla existe
     const tableCheckQuery = `
       SELECT COUNT(*) AS count
@@ -1122,12 +1130,14 @@ class SyncService {
       logger.debug(`Creando tabla ${schemaName}.${tableName}`);
       await this.targetConnection.exec(createTableQuery);
       logger.info(`Tabla ${schemaName}.${tableName} creada exitosamente`);
+      // ✅ Marcar tabla como verificada
+      this.tablesColumnsVerified.add(tableKey);
       return;
     }
 
 
     // 3️⃣ Si la tabla YA existe, verificar y agregar columnas faltantes con tipos correctos
-    logger.info(`Tabla ${schemaName}.${tableName} ya existe. Verificando columnas faltantes...`);
+    logger.debug(`Tabla ${schemaName}.${tableName} ya existe. Verificando columnas faltantes...`);
 
     // Obtener estructura completa de la tabla origen
     const sourceColumnInfoQuery = `
@@ -1229,8 +1239,11 @@ class SyncService {
     }
 
     if (missingColumns.length === 0) {
-      logger.info(`No hay columnas faltantes en ${schemaName}.${tableName}`);
+      logger.debug(`No hay columnas faltantes en ${schemaName}.${tableName}`);
     }
+
+    // ✅ Marcar tabla como verificada para no repetir en próximos ciclos
+    this.tablesColumnsVerified.add(tableKey);
   }
 
   interpretOperation(operationCode) {
