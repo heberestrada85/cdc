@@ -36,6 +36,8 @@ class CDCService {
   async getTableChanges(tableName, schemaName = 'dbo', fromLSN = null, toLSN = null) {
     // Si tenemos un fromLSN (último procesado), necesitamos incrementarlo
     // para no re-procesar el mismo cambio
+    const originalFromLSN = fromLSN;
+
     if (fromLSN) {
       const incrementResult = await this.connectionRunner.query(
         'SELECT sys.fn_cdc_increment_lsn(@lsn) AS next_lsn',
@@ -49,6 +51,11 @@ class CDCService {
     }
     if (!toLSN) {
       toLSN = await this.getLastLSN();
+    }
+
+    // Debug log para Empleados
+    if (tableName === 'Empleados') {
+      logger.info(`[CDC getTableChanges] ${schemaName}.${tableName} - fromLSN: ${fromLSN ? Buffer.from(fromLSN).toString('hex') : 'null'}, toLSN: ${toLSN ? Buffer.from(toLSN).toString('hex') : 'null'}`);
     }
 
     // Si alguno de los LSN sigue nulo, no se puede llamar
@@ -65,6 +72,9 @@ class CDCService {
       ]
     );
     if (compareResult[0]?.is_greater === 1) {
+      if (tableName === 'Empleados') {
+        logger.info(`[CDC getTableChanges] ${schemaName}.${tableName} - fromLSN > toLSN, no hay cambios nuevos`);
+      }
       return []; // No hay cambios nuevos
     }
 

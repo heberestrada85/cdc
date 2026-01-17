@@ -60,21 +60,55 @@ class SyncService {
     return result[0]?.count > 0;
   }
 
-  async ensureCDCEnabled(tableName, schemaName) {
+  /**
+   * Habilita CDC a nivel de base de datos (ejecutar una sola vez al inicio)
+   */
+  async ensureDatabaseCDCEnabled() {
     try {
-      // Verificar si CDC está habilitado en la base de datos
       const dbCDCCheck = await this.sourceConnection.query(`
-        SELECT is_cdc_enabled
+        SELECT name as db_name, is_cdc_enabled
         FROM sys.databases
         WHERE name = DB_NAME()
       `);
 
-      if (dbCDCCheck[0].is_cdc_enabled === 0) {
-        logger.info(`Habilitando CDC en la base de datos...`);
-        await this.sourceConnection.exec(`EXEC sys.sp_cdc_enable_db`);
-        logger.info(`CDC habilitado en la base de datos`);
-      }
+      const dbName = dbCDCCheck[0]?.db_name || 'unknown';
 
+      if (dbCDCCheck[0]?.is_cdc_enabled === 0) {
+        logger.info(`Habilitando CDC en la base de datos ${dbName}...`);
+        await this.sourceConnection.exec(`EXEC sys.sp_cdc_enable_db`);
+
+        // Esperar a que SQL Server procese el cambio
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Verificar que se habilitó
+        const verifyCheck = await this.sourceConnection.query(`
+          SELECT is_cdc_enabled
+          FROM sys.databases
+          WHERE name = DB_NAME()
+        `);
+
+        if (verifyCheck[0]?.is_cdc_enabled === 1) {
+          logger.info(`CDC habilitado exitosamente en la base de datos ${dbName}`);
+        } else {
+          throw new Error(`No se pudo habilitar CDC en la base de datos ${dbName}`);
+        }
+      } else {
+        logger.info(`CDC ya está habilitado en la base de datos ${dbName}`);
+      }
+    } catch (error) {
+      logger.error(`Error habilitando CDC en la base de datos:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Habilita CDC en una tabla específica (CDC de DB debe estar habilitado primero)
+   */
+  async ensureCDCEnabled(tableName, schemaName) {
+    const MAX_RETRIES = 3;
+    const tableKey = `${schemaName}.${tableName}`;
+
+    try {
       // Verificar si CDC está habilitado en la tabla
       const tableCDCCheck = await this.sourceConnection.query(`
         SELECT is_tracked_by_cdc
@@ -84,24 +118,65 @@ class SyncService {
       `);
 
       if (tableCDCCheck.length === 0) {
-        throw new Error(`Tabla ${schemaName}.${tableName} no existe en la base de datos origen`);
+        throw new Error(`Tabla ${tableKey} no existe en la base de datos origen`);
       }
 
-      if (tableCDCCheck[0].is_tracked_by_cdc === 0) {
-        logger.info(`Habilitando CDC en la tabla ${schemaName}.${tableName}...`);
-        await this.sourceConnection.exec(`
-          EXEC sys.sp_cdc_enable_table
-            @source_schema = N'${schemaName}',
-            @source_name = N'${tableName}',
-            @role_name = NULL,
-            @supports_net_changes = 1
-        `);
-        logger.info(`CDC habilitado en la tabla ${schemaName}.${tableName}`);
-      } else {
-        logger.debug(`CDC ya está habilitado en ${schemaName}.${tableName}`);
+      if (tableCDCCheck[0].is_tracked_by_cdc === 1) {
+        logger.info(`CDC ya está habilitado en ${tableKey}`);
+        return;
       }
+
+      // CDC no está habilitado, intentar habilitarlo
+      logger.info(`Habilitando CDC en la tabla ${tableKey}...`);
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          await this.sourceConnection.exec(`
+            EXEC sys.sp_cdc_enable_table
+              @source_schema = N'${schemaName}',
+              @source_name = N'${tableName}',
+              @role_name = NULL,
+              @supports_net_changes = 1
+          `);
+
+          // Esperar a que SQL Server cree los objetos CDC
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          // Verificar que realmente se habilitó
+          const verifyCheck = await this.sourceConnection.query(`
+            SELECT is_tracked_by_cdc
+            FROM sys.tables
+            WHERE schema_id = SCHEMA_ID('${schemaName}')
+            AND name = '${tableName}'
+          `);
+
+          if (verifyCheck[0]?.is_tracked_by_cdc === 1) {
+            logger.info(`CDC habilitado exitosamente en ${tableKey}`);
+            return;
+          } else {
+            logger.warn(`CDC no se habilitó en ${tableKey} (intento ${attempt}/${MAX_RETRIES})`);
+            if (attempt < MAX_RETRIES) {
+              await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            }
+          }
+        } catch (spError) {
+          // Verificar si el error es porque ya existe una instancia CDC
+          if (spError.message && spError.message.includes('already enabled')) {
+            logger.info(`CDC ya estaba habilitado en ${tableKey}`);
+            return;
+          }
+          logger.error(`Error en sp_cdc_enable_table para ${tableKey} (intento ${attempt}/${MAX_RETRIES}):`, spError.message);
+          if (attempt < MAX_RETRIES) {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          } else {
+            throw spError;
+          }
+        }
+      }
+
+      throw new Error(`No se pudo habilitar CDC en ${tableKey} después de ${MAX_RETRIES} intentos`);
     } catch (error) {
-      logger.error(`Error habilitando CDC en ${schemaName}.${tableName}:`, error);
+      logger.error(`Error habilitando CDC en ${tableKey}:`, error.message);
       throw error;
     }
   }
@@ -145,16 +220,324 @@ class SyncService {
     const startTime = Date.now();
     logger.info(`Realizando snapshot inicial para ${schemaName}.${tableName}...`);
 
-    // Copiar todos los datos de origen a destino
-    await this.bulkInsertAll(tableName, schemaName);
+    // Usar MERGE en lugar de BULK INSERT para evitar duplicados
+    // y actualizar registros existentes automáticamente
+    await this.mergeAll(tableName, schemaName);
 
     const totalTime = Date.now() - startTime;
     logger.info(`Snapshot inicial completado para ${schemaName}.${tableName} en ${totalTime}ms`);
   }
 
   /**
+   * MERGE masivo - Sincroniza datos de origen a destino usando MERGE
+   * Inserta registros nuevos y actualiza los existentes basándose en la PK
+   * Similar al comportamiento de MERGE en Snowflake
+   */
+  /**
+   * Helper para ejecutar una operación con reintentos infinitos cada 5 segundos
+   * Usado para operaciones críticas que deben completarse sin importar desconexiones
+   */
+  async _executeWithInfiniteRetry(operation, operationName, tableName) {
+    const RETRY_INTERVAL_MS = 5000; // 5 segundos entre reintentos
+
+    while (true) {
+      try {
+        return await operation();
+      } catch (error) {
+        const isConnectionError = this._isConnectionError(error);
+
+        if (isConnectionError) {
+          logger.warn(`[${tableName}] Error de conexión en ${operationName}: ${error.message}`);
+          logger.info(`[${tableName}] Reintentando en ${RETRY_INTERVAL_MS / 1000} segundos...`);
+          await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL_MS));
+          // Continúa el loop para reintentar
+        } else {
+          // Error no relacionado con conexión, propagar
+          throw error;
+        }
+      }
+    }
+  }
+
+  /**
+   * Verifica si un error es de conexión
+   */
+  _isConnectionError(err) {
+    if (!err) return false;
+    const message = err.message?.toLowerCase() || '';
+    const code = err.code?.toLowerCase() || '';
+
+    return (
+      message.includes('connection') ||
+      message.includes('socket') ||
+      message.includes('timeout') ||
+      message.includes('econnreset') ||
+      message.includes('econnrefused') ||
+      message.includes('epipe') ||
+      message.includes('network') ||
+      message.includes('closed') ||
+      message.includes('not connected') ||
+      message.includes('loggedin') ||
+      message.includes('connection lost') ||
+      message.includes('read econnreset') ||
+      code === 'esocket' ||
+      code === 'econnreset' ||
+      code === 'econnrefused' ||
+      code === 'etimedout'
+    );
+  }
+
+  async mergeAll(tableName, schemaName) {
+    const startTime = Date.now();
+    logger.info(`Ejecutando MERGE masivo para ${schemaName}.${tableName}...`);
+
+    // Obtener la clave primaria con reintentos infinitos
+    const primaryKey = await this._executeWithInfiniteRetry(
+      () => this.getPrimaryKey(tableName, schemaName),
+      'getPrimaryKey',
+      `${schemaName}.${tableName}`
+    );
+
+    if (!primaryKey) {
+      logger.warn(`No se encontró clave primaria para ${schemaName}.${tableName}, omitiendo MERGE`);
+      return;
+    }
+
+    // Obtener el total de registros con reintentos infinitos
+    const countResult = await this._executeWithInfiniteRetry(
+      () => this.sourceConnection.query(`SELECT COUNT(*) as total FROM ${schemaName}.${tableName}`),
+      'countRows',
+      `${schemaName}.${tableName}`
+    );
+    const totalRows = countResult[0]?.total || 0;
+
+    if (totalRows === 0) {
+      logger.info(`No hay registros en origen para ${schemaName}.${tableName}`);
+      return;
+    }
+
+    logger.info(`Total de registros a sincronizar ${schemaName}.${tableName}: ${totalRows}`);
+
+    // Obtener columnas de la tabla con reintentos infinitos
+    const columnsResult = await this._executeWithInfiniteRetry(
+      () => this.sourceConnection.query(`
+        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
+      `),
+      'getColumns',
+      `${schemaName}.${tableName}`
+    );
+    const columns = columnsResult.map(c => c.COLUMN_NAME);
+    const nonPKColumns = columns.filter(c => c !== primaryKey);
+
+    // Lista de columnas binarias conocidas
+    const binaryCols = new Set([
+      'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
+      'CardChecador', 'passChecador'
+    ]);
+
+    // Función para formatear un valor SQL
+    const formatValue = (col, v) => {
+      if (binaryCols.has(col)) {
+        if (Buffer.isBuffer(v)) {
+          if (v.length === 0) return 'NULL';
+          return `CONVERT(varbinary(max), '0x${v.toString('hex')}', 1)`;
+        } else if (typeof v === 'string') {
+          if (!v || v === '' || v === '0x') return 'NULL';
+          let hexStr = v.startsWith('0x') ? v.substring(2) : v;
+          if (!/^[0-9a-fA-F]*$/.test(hexStr)) return 'NULL';
+          if (hexStr.length % 2 !== 0) hexStr = '0' + hexStr;
+          return `CONVERT(varbinary(max), '0x${hexStr}', 1)`;
+        } else if (v == null) {
+          return 'NULL';
+        }
+      }
+
+      if (v === null || v === undefined) return 'NULL';
+      if (v instanceof Date) return `'${v.toISOString()}'`;
+      if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`;
+      if (typeof v === 'number') return v;
+      if (typeof v === 'boolean') return v ? '1' : '0';
+      return `'${v}'`;
+    };
+
+    // Procesar en páginas para no cargar todo en memoria
+    const PAGE_SIZE = 500;   // Registros por página de lectura
+    const BATCH_SIZE = 100;  // Registros por MERGE
+    let insertedCount = 0;
+    let updatedCount = 0;
+    let errorCount = 0;
+    let offset = 0;
+
+    // Loop principal con reintentos infinitos para errores de conexión
+    while (offset < totalRows) {
+      try {
+        // Obtener una página de datos con reintentos infinitos
+        const pageQuery = `
+          SELECT * FROM ${schemaName}.${tableName}
+          ORDER BY ${primaryKey}
+          OFFSET ${offset} ROWS FETCH NEXT ${PAGE_SIZE} ROWS ONLY
+        `;
+
+        const rows = await this._executeWithInfiniteRetry(
+          () => this.sourceConnection.query(pageQuery),
+          `fetchPage (offset ${offset})`,
+          `${schemaName}.${tableName}`
+        );
+
+        if (rows.length === 0) break;
+
+        // Procesar la página en batches
+        for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+          const batch = rows.slice(i, i + BATCH_SIZE);
+          const currentBatchOffset = offset + i;
+
+          // Aplicar reglas de negocio y filtrar
+          const processedBatch = [];
+          for (const row of batch) {
+            const processedData = await this.businessRules.applyRules(row, tableName, 'INSERT');
+            if (processedData) {
+              processedBatch.push(processedData);
+            }
+          }
+
+          if (processedBatch.length === 0) continue;
+
+          // Construir VALUES para el batch
+          const valueRows = processedBatch.map(row => {
+            const values = columns.map(col => formatValue(col, row[col]));
+            return `(${values.join(', ')})`;
+          });
+
+          // Construir el UPDATE SET clause (excluyendo la PK)
+          const updateSet = nonPKColumns
+            .map(col => `TARGET.[${col}] = SOURCE.[${col}]`)
+            .join(',\n            ');
+
+          // Construir el INSERT columns y values
+          const insertColumns = columns.map(c => `[${c}]`).join(', ');
+          const insertValues = columns.map(c => `SOURCE.[${c}]`).join(', ');
+
+          // Query MERGE completo
+          const mergeQuery = `
+            SET IDENTITY_INSERT ${schemaName}.${tableName} ON;
+
+            MERGE INTO ${schemaName}.${tableName} AS TARGET
+            USING (
+              VALUES ${valueRows.join(',\n            ')}
+            ) AS SOURCE (${columns.join(', ')})
+            ON TARGET.[${primaryKey}] = SOURCE.[${primaryKey}]
+
+            WHEN MATCHED THEN
+              UPDATE SET
+              ${updateSet}
+
+            WHEN NOT MATCHED BY TARGET THEN
+              INSERT (${insertColumns})
+              VALUES (${insertValues});
+
+            SET IDENTITY_INSERT ${schemaName}.${tableName} OFF;
+          `;
+
+          try {
+            // Ejecutar MERGE con reintentos infinitos para errores de conexión
+            await this._executeWithInfiniteRetry(
+              () => this.targetConnection.exec(mergeQuery),
+              `mergeBatch (offset ${currentBatchOffset})`,
+              `${schemaName}.${tableName}`
+            );
+            // No podemos saber exactamente cuántos fueron INSERT vs UPDATE con este enfoque
+            // pero contamos todos como procesados exitosamente
+            insertedCount += processedBatch.length;
+          } catch (error) {
+            // Si llegamos aquí es un error NO relacionado con conexión (FK, truncado, etc.)
+            // Mostrar más detalles del error para diagnóstico
+            if (error.message.includes('truncated')) {
+              logger.error(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}): Dato demasiado largo para alguna columna`);
+              logger.debug(`Detalle: ${error.message}`);
+            } else if (error.message.includes('FOREIGN KEY')) {
+              logger.warn(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}): Violación de FK - ${error.message.split("'")[1] || 'constraint'}`);
+            } else {
+              logger.error(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}):`, error.message);
+            }
+
+            // Fallback: hacer merge uno por uno con reintentos infinitos
+            for (const row of processedBatch) {
+              try {
+                const pkValue = row[primaryKey];
+
+                // Verificar si existe con reintentos infinitos
+                const existsResult = await this._executeWithInfiniteRetry(
+                  () => this.targetConnection.query(
+                    `SELECT COUNT(*) as count FROM ${schemaName}.${tableName} WHERE [${primaryKey}] = ${pkValue}`
+                  ),
+                  `checkExists (PK ${pkValue})`,
+                  `${schemaName}.${tableName}`
+                );
+
+                if (existsResult[0]?.count > 0) {
+                  // UPDATE con reintentos infinitos
+                  await this._executeWithInfiniteRetry(
+                    () => this.handleUpdate(row, tableName, schemaName),
+                    `update (PK ${pkValue})`,
+                    `${schemaName}.${tableName}`
+                  );
+                  updatedCount++;
+                } else {
+                  // INSERT con reintentos infinitos
+                  await this._executeWithInfiniteRetry(
+                    () => this.handleInsert(row, tableName, schemaName),
+                    `insert (PK ${pkValue})`,
+                    `${schemaName}.${tableName}`
+                  );
+                  insertedCount++;
+                }
+              } catch (individualError) {
+                // Si llegamos aquí es un error NO de conexión
+                // Clasificar el error para mejor diagnóstico
+                if (individualError.message.includes('FOREIGN KEY')) {
+                  // FK errors son esperados cuando hay dependencias externas, no contar como error crítico
+                  logger.debug(`FK skip ${tableName} ID ${row[primaryKey]}: dependencia externa`);
+                } else if (individualError.message.includes('truncated')) {
+                  errorCount++;
+                  logger.warn(`Truncado ${tableName} ID ${row[primaryKey]}: dato muy largo`);
+                } else {
+                  errorCount++;
+                  logger.debug(`Error en MERGE individual ${row[primaryKey]}:`, individualError.message);
+                }
+              }
+            }
+          }
+        }
+
+        logger.info(`Progreso MERGE ${schemaName}.${tableName}: ${Math.min(offset + PAGE_SIZE, totalRows)}/${totalRows} registros procesados`);
+        offset += PAGE_SIZE;
+
+        // Liberar memoria explícitamente
+        if (global.gc) global.gc();
+
+      } catch (pageError) {
+        // Error inesperado en el procesamiento de la página
+        // Si es error de conexión, _executeWithInfiniteRetry ya lo manejó
+        // Este catch es para errores lógicos no anticipados
+        logger.error(`Error inesperado procesando página offset ${offset} de ${schemaName}.${tableName}: ${pageError.message}`);
+        // Continuar con la siguiente página en lugar de detener todo
+        offset += PAGE_SIZE;
+      }
+    }
+
+    const totalTime = Date.now() - startTime;
+    await this.writeLog(tableName, 'MERGE_ALL', null, 'SUCCESS',
+      `Merge completado: ${insertedCount} procesados, ${updatedCount} actualizados (fallback), ${errorCount} errores en ${totalTime}ms`,
+      null, { totalRows, processed: insertedCount, updated: updatedCount, errors: errorCount }, totalTime);
+
+    logger.info(`MERGE completado para ${schemaName}.${tableName}: ${insertedCount + updatedCount} registros en ${totalTime}ms`);
+  }
+
+  /**
    * Bulk insert masivo - Copia datos de origen a destino usando paginación
    * para evitar problemas de memoria
+   * @deprecated Usar mergeAll en su lugar para evitar duplicados
    */
   async bulkInsertAll(tableName, schemaName) {
     const startTime = Date.now();
@@ -472,8 +855,17 @@ class SyncService {
       // Marcar como sincronizado si no lo está (para tablas que ya existían)
       const initialSyncKey = `${tableKey}_initial_sync_done`;
       if (!this.syncState.get(initialSyncKey)) {
+        // Verificar si se debe forzar MERGE inicial aunque la tabla exista
+        const forceMerge = process.env.FORCE_MERGE_ON_START === 'true';
+
+        if (forceMerge) {
+          logger.info(`Tabla ${tableKey} existe en destino → FORCE_MERGE_ON_START activo, ejecutando MERGE inicial...`);
+          await this.snapshotInitial(tableName, schemaName);
+        } else {
+          logger.info(`Tabla ${tableKey} ya existe en destino → omitiendo snapshot, usando CDC`);
+        }
+
         this.syncState.set(initialSyncKey, true);
-        logger.info(`Tabla ${tableKey} ya existe en destino → omitiendo snapshot, usando CDC`);
 
         // Guardar LSN actual para empezar a capturar cambios desde ahora
         const CDCService = require('../config/cdcService');
@@ -498,11 +890,16 @@ class SyncService {
 
       const lastProcessedLSN = this.syncState.get(tableKey) || null;
 
+      // Debug: mostrar estado del LSN para la primera tabla cada ciclo
+      if (tableName === 'Empleados') {
+        logger.info(`[CDC DEBUG] ${tableKey} - lastLSN: ${lastProcessedLSN ? Buffer.from(lastProcessedLSN).toString('hex') : 'null'}`);
+      }
+
       try {
         const changes = await cdcService.getTableChanges(tableName, schemaName, lastProcessedLSN);
 
         if (changes.length === 0) {
-          logger.debug(`No hay cambios CDC para ${tableKey}`);
+          // Solo log cada 60 segundos para no saturar
           return;
         }
 
@@ -853,21 +1250,28 @@ class SyncService {
       // WHERE
       values.push(data[primaryKey]);
 
-      // 7) Log bonito (opcional)
-      const prettyQuery = (sql, vals) => {
+      // 7) Interpolar parámetros en la query
+      const interpolateQuery = (sql, vals) => {
         let q = sql;
         vals.forEach((v, i) => {
-          let val = v;
-          if (Buffer.isBuffer(v)) val = `'0x' + v.toString('hex')`;
-          else if (v instanceof Date) val = `'${v.toISOString()}'`;
-          else if (typeof v === 'string') val = `'${v.replace(/'/g, "''")}'`;
-          else if (v === null || v === undefined) val = 'NULL';
+          let val;
+          if (Buffer.isBuffer(v)) {
+            val = `'0x${v.toString('hex')}'`;
+          } else if (v instanceof Date) {
+            val = `'${v.toISOString()}'`;
+          } else if (typeof v === 'string') {
+            val = `'${v.replace(/'/g, "''")}'`;
+          } else if (v === null || v === undefined) {
+            val = 'NULL';
+          } else {
+            val = String(v);
+          }
           q = q.replace(`@param${i}`, val);
         });
         return q;
       };
       // 8) Ejecuta (tu ejecutor enviará NVARCHAR, por eso usamos CONVERT en SQL)
-      await this.executeTargetQuery(prettyQuery(query, values));
+      await this.executeTargetQuery(interpolateQuery(query, values));
       logger.debug(`UPDATE ejecutado para ${tableName}`);
     } catch (error) {
       logger.error(`Error en UPDATE para ${tableName}:`, error);

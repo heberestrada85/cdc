@@ -1,3 +1,44 @@
-./logs/*
-node_modules/*
+# Dependencies
+node_modules/
+
+# Environment variables
 .env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Reports (generated files)
+reports/
+
+# Scripts de sincronizacion SQL generados
+scripts/sync/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Docker
+.docker-version
+
+# Backups and temp files
+*.bak
+*.tmp
+*.sql.bak
+
+# SQL data files (large insert scripts)
+scripts/*.sql
+
+# Keep scripts directory structure but ignore generated SQL
+!scripts/.gitkeep

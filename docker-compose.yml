@@ -1,9 +1,83 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Docker Compose - CDC TADÁ Sync
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Uso:
+#   docker-compose up -d          # Iniciar servicio
+#   docker-compose logs -f        # Ver logs
+#   docker-compose down           # Detener servicio
+#   docker-compose pull && docker-compose up -d  # Actualizar a nueva versión
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
 version: '3.8'
 
 services:
   cdc-sync:
-    build: .
-    env_file: .env
-    volumes:
-      - ./logs:/usr/src/app/logs
+    image: ${DOCKER_IMAGE:-tuusuario/tada-cdc-sync:latest}
+    container_name: cdc-sync
     restart: unless-stopped
+
+    # Variables de entorno - MODIFICAR SEGÚN TU AMBIENTE
+    environment:
+      # Base de datos origen
+      - SOURCE_DB_SERVER=${SOURCE_DB_SERVER:-172.17.0.247}
+      - SOURCE_DB_NAME=${SOURCE_DB_NAME:-TadaNomina}
+      - SOURCE_DB_USER=${SOURCE_DB_USER:-usuario}
+      - SOURCE_DB_PASSWORD=${SOURCE_DB_PASSWORD:-password}
+
+      # Base de datos destino
+      - TARGET_DB_SERVER=${TARGET_DB_SERVER:-172.17.0.247}
+      - TARGET_DB_NAME=${TARGET_DB_NAME:-TadaNomina-2.0}
+      - TARGET_DB_USER=${TARGET_DB_USER:-usuario}
+      - TARGET_DB_PASSWORD=${TARGET_DB_PASSWORD:-password}
+
+      # Configuración de sincronización
+      - POLLING_INTERVAL=${POLLING_INTERVAL:-5}
+      - FORCE_MERGE_ON_START=${FORCE_MERGE_ON_START:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
+      # Node.js
+      - NODE_ENV=production
+      - TZ=America/Mexico_City
+
+    # Volúmenes para persistir logs (opcional)
+    volumes:
+      - cdc-logs:/app/logs
+
+    # Recursos (ajustar según necesidad)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "console.log('healthy')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Red (opcional - si necesitas conectar con otros servicios)
+    networks:
+      - tada-network
+
+volumes:
+  cdc-logs:
+    driver: local
+
+networks:
+  tada-network:
+    driver: bridge

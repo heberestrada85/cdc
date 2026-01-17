@@ -71,31 +71,46 @@ class CDCSyncApplication {
    * Habilita CDC en la base de datos y en todas las tablas configuradas
    */
   async setupCDC() {
-    logger.info('Configurando CDC en las tablas...');
+    // 1. Primero habilitar CDC a nivel de base de datos (una sola vez)
+    logger.info('');
+    logger.info('╔══════════════════════════════════════════════════════════════╗');
+    logger.info('║           CONFIGURANDO CDC EN BASE DE DATOS                  ║');
+    logger.info('╚══════════════════════════════════════════════════════════════╝');
+    logger.info('');
+
+    await this.syncService.ensureDatabaseCDCEnabled();
+
+    // 2. Luego habilitar CDC en cada tabla
+    logger.info('');
+    logger.info(`Habilitando CDC en ${this.tablesToSync.length} tablas...`);
+    logger.info('');
 
     let enabledCount = 0;
     let skippedCount = 0;
     let errorCount = 0;
 
-    for (const table of this.tablesToSync) {
+    for (let i = 0; i < this.tablesToSync.length; i++) {
+      const table = this.tablesToSync[i];
+      const tableIndex = `[${i + 1}/${this.tablesToSync.length}]`;
+
       try {
         // Verificar si la tabla existe en origen
         const exists = await this.syncService.checkSourceTableExists(table.name, table.schema);
         if (!exists) {
-          logger.warn(`⚠️  Tabla ${table.schema}.${table.name} NO EXISTE en origen. Omitiendo...`);
+          logger.warn(`${tableIndex} ⚠️  ${table.schema}.${table.name} NO EXISTE en origen. Omitiendo...`);
           skippedCount++;
           continue;
         }
 
         await this.syncService.ensureCDCEnabled(table.name, table.schema);
-        logger.info(`✓ CDC habilitado para ${table.schema}.${table.name}`);
         enabledCount++;
       } catch (error) {
-        logger.error(`✗ Error habilitando CDC en ${table.schema}.${table.name}:`, error.message);
+        logger.error(`${tableIndex} ✗ Error habilitando CDC en ${table.schema}.${table.name}:`, error.message);
         errorCount++;
       }
     }
 
+    logger.info('');
     logger.info(`Resumen CDC: ${enabledCount} habilitadas, ${skippedCount} no existen, ${errorCount} errores`);
 
     // Esperar un momento para que SQL Server cree las funciones CDC
@@ -126,8 +141,12 @@ class CDCSyncApplication {
     let snapshotCount = 0;
     let errorCount = 0;
 
-    for (const table of this.tablesToSync) {
+    for (let i = 0; i < this.tablesToSync.length; i++) {
+      const table = this.tablesToSync[i];
+      const tableIndex = `[${i + 1}/${this.tablesToSync.length}]`;
+
       try {
+        logger.info(`${tableIndex} Procesando ${table.schema}.${table.name}...`);
         await this.syncService.syncTable(table.name, table.schema);
 
         // Verificar si se hizo snapshot o ya existía
@@ -143,7 +162,7 @@ class CDCSyncApplication {
         }
       } catch (error) {
         errorCount++;
-        logger.error(`Error en snapshot de ${table.schema}.${table.name}:`, error.message);
+        logger.error(`${tableIndex} Error en snapshot de ${table.schema}.${table.name}:`, error.message);
       }
     }
 
@@ -172,12 +191,14 @@ class CDCSyncApplication {
     logger.info('');
 
     // Programar sincronización cada X segundos
-    const interval = process.env.POLLING_INTERVAL || 5;
-    cron.schedule(`*/${interval} * * * * *`, async () => {
-      await this.performSync();
-    });
+    const interval = parseInt(process.env.POLLING_INTERVAL, 10) || 5;
 
-    logger.info(`CDC activo - Escuchando cambios cada ${interval} segundos...`);
+    // Usar setInterval para intervalos cortos (más preciso que cron para < 5 segundos)
+    setInterval(async () => {
+      await this.performSync();
+    }, interval * 1000);
+
+    logger.info(`CDC activo - Escuchando cambios cada ${interval} segundo(s)...`);
   }
 
   async performSync() {
@@ -212,12 +233,33 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-// Iniciar aplicación
+// Función de espera
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Iniciar aplicación con reintentos
 (async () => {
-  const initialized = await app.initialize();
-  if (initialized) {
-    await app.startSync();
-  } else {
-    process.exit(1);
+  const MAX_RETRIES = Infinity; // Reintentar indefinidamente
+  const INITIAL_DELAY = 5000;   // 5 segundos inicial
+  const MAX_DELAY = 60000;      // Máximo 60 segundos entre reintentos
+
+  let retryCount = 0;
+  let delay = INITIAL_DELAY;
+
+  while (true) {
+    const initialized = await app.initialize();
+
+    if (initialized) {
+      retryCount = 0; // Reset contador si conecta exitosamente
+      delay = INITIAL_DELAY;
+      await app.startSync();
+      break; // Salir del loop si startSync termina normalmente
+    } else {
+      retryCount++;
+      logger.info(`Reintento ${retryCount}: Esperando ${delay / 1000} segundos antes de reintentar...`);
+      await sleep(delay);
+
+      // Backoff exponencial con máximo
+      delay = Math.min(delay * 1.5, MAX_DELAY);
+    }
   }
 })();

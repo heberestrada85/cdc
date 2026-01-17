@@ -6,10 +6,16 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "setup-cdc": "node scripts/setup-cdc.js"
+    "setup-cdc": "node scripts/setup-cdc.js",
+    "compare-db": "node scripts/compare-db-structures.js",
+    "compare-shared": "node scripts/compare-shared-tables.js",
+    "validate-data": "node scripts/validate-data-consistency.js",
+    "create-auditoria": "node scripts/create-auditoria-table.js",
+    "view-auditoria": "node scripts/view-auditoria.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",
+    "exceljs": "^4.4.0",
     "mssql": "^11.0.1",
     "node-cron": "^3.0.3",
     "tedious": "^16.7.1",
