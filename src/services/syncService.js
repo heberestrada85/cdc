@@ -161,8 +161,8 @@ class SyncService {
           }
         } catch (spError) {
           // Verificar si el error es porque ya existe una instancia CDC
-          if (spError.message && spError.message.includes('already enabled')) {
-            logger.info(`CDC ya estaba habilitado en ${tableKey}`);
+          if (spError.message && (spError.message.includes('already enabled') || spError.message.includes('already exists'))) {
+            logger.info(`CDC ya estaba habilitado en ${tableKey} (instancia existente)`);
             return;
           }
           logger.error(`Error en sp_cdc_enable_table para ${tableKey} (intento ${attempt}/${MAX_RETRIES}):`, spError.message);
@@ -318,10 +318,10 @@ class SyncService {
 
     logger.info(`Total de registros a sincronizar ${schemaName}.${tableName}: ${totalRows}`);
 
-    // Obtener columnas de la tabla con reintentos infinitos
+    // Obtener columnas de la tabla CON TIPO DE DATO para detectar varbinary automáticamente
     const columnsResult = await this._executeWithInfiniteRetry(
       () => this.sourceConnection.query(`
-        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
       `),
       'getColumns',
@@ -330,11 +330,12 @@ class SyncService {
     const columns = columnsResult.map(c => c.COLUMN_NAME);
     const nonPKColumns = columns.filter(c => c !== primaryKey);
 
-    // Lista de columnas binarias conocidas
-    const binaryCols = new Set([
-      'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
-      'CardChecador', 'passChecador'
-    ]);
+    // Detectar automáticamente columnas binarias desde el esquema
+    const binaryCols = new Set(
+      columnsResult
+        .filter(c => ['varbinary', 'binary', 'image'].includes(c.DATA_TYPE.toLowerCase()))
+        .map(c => c.COLUMN_NAME)
+    );
 
     // Función para formatear un valor SQL
     const formatValue = (col, v) => {
@@ -564,18 +565,19 @@ class SyncService {
 
     logger.info(`Total de registros a copiar ${schemaName}.${tableName}: ${totalRows}`);
 
-    // Obtener columnas de la tabla
+    // Obtener columnas de la tabla CON TIPO DE DATO
     const columnsResult = await this.sourceConnection.query(`
-      SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
     `);
     const columns = columnsResult.map(c => c.COLUMN_NAME);
 
-    // Lista de columnas binarias conocidas
-    const binaryCols = new Set([
-      'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
-      'CardChecador', 'passChecador'
-    ]);
+    // Detectar automáticamente columnas binarias desde el esquema
+    const binaryCols = new Set(
+      columnsResult
+        .filter(c => ['varbinary', 'binary', 'image'].includes(c.DATA_TYPE.toLowerCase()))
+        .map(c => c.COLUMN_NAME)
+    );
 
     // Función para formatear un valor SQL
     const formatValue = (col, v) => {
@@ -826,7 +828,19 @@ class SyncService {
       }
 
       // 1️⃣ Asegurar que CDC esté habilitado en la tabla origen
-      await this.ensureCDCEnabled(tableName, schemaName);
+      let cdcEnabled = false;
+      try {
+        await this.ensureCDCEnabled(tableName, schemaName);
+        cdcEnabled = true;
+      } catch (cdcError) {
+        // Si FORCE_MERGE_ON_START está activo, continuamos con el snapshot aunque CDC falle
+        const forceMerge = process.env.FORCE_MERGE_ON_START === 'true';
+        if (forceMerge) {
+          logger.warn(`CDC falló para ${tableKey}, pero FORCE_MERGE_ON_START activo → continuando con snapshot: ${cdcError.message}`);
+        } else {
+          throw cdcError;
+        }
+      }
 
       // 2️⃣ Verificar si la tabla destino existe
       const targetTableExists = await this.checkTargetTableExists(tableName, schemaName);
@@ -959,11 +973,16 @@ class SyncService {
       await this.ensureTableAndColumnsExist(tableName, schemaName, data);
       const columns = Object.keys(data).filter(key => !key.startsWith('__$'));
 
-      // Lista de columnas binarias conocidas
-      const binaryCols = new Set([
-        'PassKiosko', 'Contrasena', 'Password', 'Foto', 'ImagenPerfil',
-        'CardChecador', 'passChecador'
-      ]);
+      // Detectar automáticamente columnas binarias desde el esquema
+      const columnsInfo = await this.sourceConnection.query(`
+        SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
+      `);
+      const binaryCols = new Set(
+        columnsInfo
+          .filter(c => ['varbinary', 'binary', 'image'].includes(c.DATA_TYPE.toLowerCase()))
+          .map(c => c.COLUMN_NAME)
+      );
 
       // Construir VALUES con CONVERT para columnas varbinary
       const valuesList = columns.map(col => {
@@ -1186,15 +1205,16 @@ class SyncService {
       const primaryKey = await this.getPrimaryKey(tableName, schemaName);
       const updateColumns = columns.filter(col => col !== primaryKey);
 
-      // 🚩 Lista de columnas VARBINARY reales (ajústala según tu tabla)
-      const binaryCols = new Set([
-        'PassKiosko',       // seguro
-        'Contrasena',       // si es varbinary
-        'Foto',             // si es varbinary
-        'ImagenPerfil',     // si es varbinary
-        'CardChecador',     // si es varbinary
-        'passChecador'      // si es varbinary
-      ]);
+      // Detectar automáticamente columnas binarias desde el esquema
+      const columnsInfo = await this.sourceConnection.query(`
+        SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '${schemaName}' AND TABLE_NAME = '${tableName}'
+      `);
+      const binaryCols = new Set(
+        columnsInfo
+          .filter(c => ['varbinary', 'binary', 'image'].includes(c.DATA_TYPE.toLowerCase()))
+          .map(c => c.COLUMN_NAME)
+      );
 
       // 4) SET: para binarios usa CONVERT(..., 1)  ← estilo 1 = espera '0x...'
       const setClause = updateColumns.map((col, i) => {
@@ -1644,6 +1664,61 @@ class SyncService {
 
     if (missingColumns.length === 0) {
       logger.debug(`No hay columnas faltantes en ${schemaName}.${tableName}`);
+    }
+
+    // 4️⃣ Sincronizar tamaño de columnas existentes (para evitar truncamiento)
+    // Obtener estructura detallada de columnas en destino
+    const targetColumnInfoQuery = `
+      SELECT
+        c.COLUMN_NAME,
+        c.DATA_TYPE,
+        c.CHARACTER_MAXIMUM_LENGTH,
+        c.NUMERIC_PRECISION,
+        c.NUMERIC_SCALE
+      FROM INFORMATION_SCHEMA.COLUMNS c
+      WHERE c.TABLE_SCHEMA = '${schemaName}' AND c.TABLE_NAME = '${tableName}'
+    `;
+    const targetColumns = await this.targetConnection.query(targetColumnInfoQuery);
+    const targetColumnMap = new Map(targetColumns.map(c => [c.COLUMN_NAME.toLowerCase(), c]));
+
+    // Comparar y actualizar columnas que necesiten más espacio
+    for (const srcCol of sourceColumns) {
+      const colName = srcCol.COLUMN_NAME.toLowerCase();
+      const targetCol = targetColumnMap.get(colName);
+
+      if (!targetCol) continue; // Columna no existe en destino (ya se agregó arriba)
+
+      // Solo comparar tipos de string/binary que pueden tener diferente tamaño
+      const srcDataType = srcCol.DATA_TYPE.toLowerCase();
+      const tgtDataType = targetCol.DATA_TYPE.toLowerCase();
+
+      const resizableTypes = ['varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary'];
+      if (!resizableTypes.includes(srcDataType)) continue;
+
+      // Verificar si los tipos base son compatibles
+      if (srcDataType !== tgtDataType) continue;
+
+      const srcLength = srcCol.CHARACTER_MAXIMUM_LENGTH;
+      const tgtLength = targetCol.CHARACTER_MAXIMUM_LENGTH;
+
+      // Si origen es MAX (-1) o mayor que destino, necesitamos ampliar
+      const needsResize = (srcLength === -1 && tgtLength !== -1) ||
+                          (srcLength > tgtLength && tgtLength !== -1);
+
+      if (needsResize) {
+        const newDataType = mapDataType(srcCol);
+        try {
+          const alterQuery = `
+            ALTER TABLE ${schemaName}.${tableName}
+            ALTER COLUMN [${srcCol.COLUMN_NAME}] ${newDataType}
+          `;
+          await this.targetConnection.exec(alterQuery);
+          logger.info(`Columna '${srcCol.COLUMN_NAME}' redimensionada a ${newDataType} en ${schemaName}.${tableName}`);
+        } catch (alterError) {
+          // Si falla el ALTER (por índices, constraints, etc.), solo logueamos warning
+          logger.warn(`No se pudo redimensionar columna '${srcCol.COLUMN_NAME}' en ${schemaName}.${tableName}: ${alterError.message}`);
+        }
+      }
     }
 
     // ✅ Marcar tabla como verificada para no repetir en próximos ciclos
