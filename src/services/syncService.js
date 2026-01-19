@@ -452,15 +452,9 @@ class SyncService {
             insertedCount += processedBatch.length;
           } catch (error) {
             // Si llegamos aquí es un error NO relacionado con conexión (FK, truncado, etc.)
-            // Mostrar más detalles del error para diagnóstico
-            if (error.message.includes('truncated')) {
-              logger.error(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}): Dato demasiado largo para alguna columna`);
-              logger.debug(`Detalle: ${error.message}`);
-            } else if (error.message.includes('FOREIGN KEY')) {
-              logger.warn(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}): Violación de FK - ${error.message.split("'")[1] || 'constraint'}`);
-            } else {
-              logger.error(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}):`, error.message);
-            }
+            // SIEMPRE mostrar el mensaje de error completo para diagnóstico
+            const errorMsg = error.message || error.toString() || 'Error desconocido';
+            logger.error(`Error en MERGE batch ${schemaName}.${tableName} (offset ${currentBatchOffset}): ${errorMsg}`);
 
             // Fallback: hacer merge uno por uno con reintentos infinitos
             for (const row of processedBatch) {
@@ -495,17 +489,10 @@ class SyncService {
                 }
               } catch (individualError) {
                 // Si llegamos aquí es un error NO de conexión
-                // Clasificar el error para mejor diagnóstico
-                if (individualError.message.includes('FOREIGN KEY')) {
-                  // FK errors son esperados cuando hay dependencias externas, no contar como error crítico
-                  logger.debug(`FK skip ${tableName} ID ${row[primaryKey]}: dependencia externa`);
-                } else if (individualError.message.includes('truncated')) {
-                  errorCount++;
-                  logger.warn(`Truncado ${tableName} ID ${row[primaryKey]}: dato muy largo`);
-                } else {
-                  errorCount++;
-                  logger.debug(`Error en MERGE individual ${row[primaryKey]}:`, individualError.message);
-                }
+                // SIEMPRE mostrar el error completo para diagnóstico
+                const errMsg = individualError.message || individualError.toString() || 'Error desconocido';
+                errorCount++;
+                logger.error(`Error en registro ${tableName} ID ${row[primaryKey]}: ${errMsg}`);
               }
             }
           }
